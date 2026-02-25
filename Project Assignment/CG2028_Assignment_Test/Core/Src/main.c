@@ -79,7 +79,7 @@ int main(void)
 		filt_avg_asm[1]=mov_avg(N,accel_buff_y);
 		filt_avg_asm[2]=mov_avg(N,accel_buff_z);
 		printf("Expected result (X): %d, Current result: %d \n", filt_avg_c[0],filt_avg_asm[0]);
-					printf("Expected result (Y): %d, Current result: %d \n", filt_avg_c[1],filt_avg_asm[1]);
+		printf("Expected result (Y): %d, Current result: %d \n", filt_avg_c[1],filt_avg_asm[1]);
 					printf("Expected result (Z): %d, Current result: %d \n", filt_avg_c[2],filt_avg_asm[2]);
 		//Check whether the returned values of the assembly and the C code are the same
 		if( (filt_avg_asm[0]!=filt_avg_c[0]) ||
