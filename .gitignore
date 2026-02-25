@@ -25,3 +25,6 @@ build/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local secrets
+Project Assignment/CG2028_Assignment/Core/Inc/wifi_secrets.h

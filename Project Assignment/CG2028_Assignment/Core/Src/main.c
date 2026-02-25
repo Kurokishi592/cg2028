@@ -11,6 +11,7 @@
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01.h"
+#include "wifi_service.h"
 
 #include "stdio.h"
 #include "string.h"
@@ -25,6 +26,8 @@ extern void initialise_monitor_handles(void);	// for semi-hosting support (print
 extern int mov_avg(int N, int* accel_buff); // asm implementation
 
 int mov_avg_C(int N, int* accel_buff); // Reference C implementation
+
+void blink_LED2(int delay_ms); // Function to blink LED2 with a specified delay (in milliseconds)
 
 typedef enum
 {
@@ -64,6 +67,8 @@ int main(void)
 	bool fallDetected = false;									// Flag to indicate if a fall has been detected
 	int button_press_ticks = 0;
 	bool button_reset_armed = true;
+
+	bool wifiConnected = false;
 
 	while (1) {
 		BSP_LED_Toggle(LED2);									// This function helps to toggle the current LED state
@@ -108,6 +113,17 @@ int main(void)
 		// UART transmission of the results
 
 		char buffer[150]; 										// Create a buffer large enough to hold the text
+		if (!wifiConnected) {
+			sprintf(buffer, "HELLO\r\n");
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			int wifi_connect_status = WIFI_Init();
+			sprintf(buffer, "Wi-Fi connection status: %d\r\n", wifi_connect_status);
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			if (wifi_connect_status == 0) {
+				wifiConnected = true;
+			}
+			HAL_Delay(20);
+		}
 
 		// Transmitting results of C execution over UART
 		if(i>=3 && !fallDetected) {								// Start transmitting only after we have enough readings to fill the buffer and if a fall has not been detected yet
@@ -158,16 +174,20 @@ int main(void)
 				sprintf(buffer, "Classification: NEAR-FALL\r\n");
 				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 				fallDetected = true;
+				int https_status = WIFI_SendHttpRequest(0);
 			}
 			else if(fall_event == FALL_EVENT_REAL_FALL)
 			{
 				sprintf(buffer, "Classification: REAL FALL\r\n");
 				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 				fallDetected = true;
+				// Optional: send HTTPS Telegram request after detection
+				int https_status = WIFI_SendHttpRequest(1);
 			}
 		}
 		if (fallDetected) {
 			blink_LED2(500); // Blink LED2 every 500ms to indicate a fall has been detected
+			// Should add smth abt buzzer here
 		}
 		if (BSP_PB_GetState(BUTTON_USER) == GPIO_PIN_SET) {
 			if(button_press_ticks < button_reset_ticks_required) {
