@@ -10,98 +10,166 @@
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
+#include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_magneto.h"
 
 #include "stdio.h"
 #include "string.h"
 #include "math.h"
 #include <sys/stat.h>
+#include <stdbool.h>
 
+#ifdef DEBUG
+#define FALL_DEBUG 1
+#endif
+
+#define hypotf(x,y) sqrtf((x)*(x) + (y)*(y))
+#define sqr(x) ((x)*(x))
+
+static void init(void);
+void blink_LED2(int delay_ms);
 static void UART1_Init(void);
-
 extern void initialise_monitor_handles(void);	// for semi-hosting support (printf). Will not be required if transmitting via UART
-
 extern int mov_avg(int N, int* accel_buff); // asm implementation
-
 int mov_avg_C(int N, int* accel_buff); // Reference C implementation
 
 typedef enum
 {
 	FALL_EVENT_NONE = 0,
-	FALL_EVENT_NEAR_FALL,
-	FALL_EVENT_REAL_FALL
+	FALL_EVENT_NEAR_FALL = 1,
+	FALL_EVENT_REAL_FALL = 2
 } fall_event_t;
 
 fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3]);
+fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw);
 
 UART_HandleTypeDef huart1;
 
+static void fd_update_windows(float acc_mag, float gyro_mag);
 
+static void fd_get_ranges(float *acc_range, float *gyro_range);
+
+/* --------------------------- Globals and constants --------------------------- */
+const int N=4; // size of buffer
+int delay_ms=500; // LED blink period; adjusted based on fall classification
+const float G = 9.8f; // Gravitational acceleration constant
+
+// MPU raw data (for potential debugging/extension)
+float ax = 0.0f, ay = 0.0f, az = 0.0f;
+float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+float mx = 0.0f, my = 0.0f, mz = 0.0f;
+
+// Circular buffer to store most recent 4 accel readings
+int accel_buff_x[4]={0};
+int accel_buff_y[4]={0};
+int accel_buff_z[4]={0};
+int i=0;												// Counter to keep track of how many readings have been taken
+
+float roll_pitch_yaw[3] = {0.0f};
+
+// Sliding windows for recent accel/gyro magnitudes (for MAX-MIN range)
+// Shorter window so gyro range "memory" decays faster after a spike
+#define FD_WINDOW_SIZE 10
+static float acc_mag_window[FD_WINDOW_SIZE] = {0.0f};
+static float gyro_mag_window[FD_WINDOW_SIZE] = {0.0f};
+static int fd_win_idx = 0;
+static int fd_win_filled = 0;
+
+
+/* ---------------------------------------------------------------------------------------------------------- */
+
+/*
+ * This is the state machine of the fall detection algorithm.
+ * Init -> Filter sensor accelerometer readings -> Calculate ||AT||, ||GT|| and angle <-> Check ||AT||>t_m -> (delta_AT>t_at && delta_GT>t_ga) -> check angle>t_th -> classify as real fall else near fall 
+ */
 int main(void)
 {
-	const int N=4;
-
-	HAL_Init();													// Reset all peripherals, initialize flash interface and systick
-
-	UART1_Init();												// Initialize UART1 for serial communication
-
-	// Peripheral initializations using BSP functions
-	BSP_LED_Init(LED2);
-	BSP_ACCELERO_Init();
-	BSP_GYRO_Init();
-
-	BSP_LED_Off(LED2);											// Set the initial LED state to off
-
-	int accel_buff_x[4]={0};
-	int accel_buff_y[4]={0};
-	int accel_buff_z[4]={0};
-	int i=0;													// Counter to keep track of how many readings have been taken
-	int delay_ms=100; 											// Change delay time to suit your code
-
+	//-------------------------------------- Initialise Device --------------------------------------//
+	init(); // initialize peripherals and UART for transmission
+	
 	while (1)
 	{
-		BSP_LED_Toggle(LED2);									// This function helps to toggle the current LED state
-
+		/* -------------------------------------- READ ACCELEROMETER VALUES AND PRE-PROCESS -------------------------------------- */
 		int16_t accel_data_i16[3] = { 0 };						// Array to store the x, y and z readings of accelerometer
-		
 		BSP_ACCELERO_AccGetXYZ(accel_data_i16);					// Function to read accelerometer values
-
+		
 		// Copy the values over to a circular style buffer
 		accel_buff_x[i%4]=accel_data_i16[0]; 					// Acceleration along X-Axis
 		accel_buff_y[i%4]=accel_data_i16[1]; 					// Acceleration along Y-Axis
 		accel_buff_z[i%4]=accel_data_i16[2]; 					// Acceleration along Z-Axis
 
+		// Preprocessing the filtered outputs using moving average filter.
+		float accel_filt_asm[3]={0}; 							// final value of filtered acceleration values
+		accel_filt_asm[0]= (float)mov_avg(N,accel_buff_x) * (9.8/1000.0f);
+		accel_filt_asm[1]= (float)mov_avg(N,accel_buff_y) * (9.8/1000.0f);
+		accel_filt_asm[2]= (float)mov_avg(N,accel_buff_z) * (9.8/1000.0f);
 
+		// Calculate magnitude of filtered accelerometer vector (AT_t)
+		float accel_magnitude_asm = sqrtf(sqr(accel_filt_asm[0]) + sqr(accel_filt_asm[1]) + sqr(accel_filt_asm[2]));
+
+		/* -------------------------------------- READ GYROSCOPE VALUES AND PRE-PROCESS -------------------------------------- */
 		float gyro_data[3]={0.0};
-		float* ptr_gyro=gyro_data;
-		BSP_GYRO_GetXYZ(ptr_gyro);								// Function to read gyroscope values
-
+		BSP_GYRO_GetXYZ(gyro_data);								// Function to read gyroscope values
+		
 		// The output of gyro has been made to display in dps(degree per second)
 		float gyro_velocity[3]={0.0};
 		gyro_velocity[0]=(gyro_data[0]*9.8/(1000));
 		gyro_velocity[1]=(gyro_data[1]*9.8/(1000));
 		gyro_velocity[2]=(gyro_data[2]*9.8/(1000));
+		
+		// Calculate magnitude of gyro vector (GT_t)
+		float gyro_magnitude_asm = sqrtf(sqr(gyro_velocity[0]) + sqr(gyro_velocity[1]) + sqr(gyro_velocity[2]));
+		
+		// Update sliding windows and derive recent instability ranges for accel and gyro
+		fd_update_windows(accel_magnitude_asm, gyro_magnitude_asm);
+		float accel_recent_range = 0.0f;
+		float gyro_recent_range  = 0.0f;
+		fd_get_ranges(&accel_recent_range, &gyro_recent_range);
+		
 
+		/* -------------------------------------- READ MAGNETOMETER VALUES AND PRE-PROCESS -------------------------------------- */
+		int16_t mag_raw[3] = {0};
+		BSP_MAGNETO_GetXYZ(mag_raw);              // BSP expects int16_t* buffer
+		float mag_xyz[3] = {0.0f};
+		mag_xyz[0] = (float)mag_raw[0];
+		mag_xyz[1] = (float)mag_raw[1];
+		mag_xyz[2] = (float)mag_raw[2];
+		
+		/* -------------------------------------- COMPUTE ROLL & PITCH FROM ACCEL -------------------------------------- */
+		float roll_rad  = atan2f(accel_filt_asm[1], hypotf(accel_filt_asm[0], accel_filt_asm[2]));
+		float pitch_rad = atan2f(-accel_filt_asm[0], hypotf(accel_filt_asm[1], accel_filt_asm[2]));
+		roll_pitch_yaw[0] = roll_rad  * 180.0f / (float)M_PI;
+		roll_pitch_yaw[1] = pitch_rad * 180.0f / (float)M_PI;
+		
+		/* -------------------------------------- COMPUTE YAW WITH COUPLING EFFECT MITIGATION -------------------------------------- */
+		float original_magX = mag_xyz[0];
+		float original_magY = mag_xyz[1];
+		// float original_magZ = mag_xyz[2];
+		
+		// compensate for roll
+		float polar_r_xz = sqrt(mag_xyz[0]*mag_xyz[0] + mag_xyz[2]*mag_xyz[2]);
+		float theta_xz_init = atan2(mag_xyz[0],mag_xyz[2]);
+		// float polar_angle_after_roll = theta_xz_init - roll_rad;
+		mag_xyz[0] = polar_r_xz * cos(roll_rad);
+		mag_xyz[2] = polar_r_xz * sin(roll_rad);
+		
+		// compensate for pitch
+		float polar_r_yz = sqrt(mag_xyz[1]*mag_xyz[1] + mag_xyz[2]*mag_xyz[2]);
+		float theta_yz_init = atan2(mag_xyz[1],mag_xyz[2]);
+		// float polar_angle_after_pitch = theta_yz_init - pitch_rad;
+		mag_xyz[1] = polar_r_yz * cos(pitch_rad);
+		mag_xyz[2] = polar_r_yz * sin(pitch_rad);
+		
+		float deltaX = mag_xyz[0] - original_magX;
+		float deltaY = mag_xyz[1] - original_magY;
 
-		// Preprocessing the filtered outputs  The same needs to be done for the output from the C program as well
-		float accel_filt_asm[3]={0}; 							// final value of filtered acceleration values
-
-		accel_filt_asm[0]= (float)mov_avg(N,accel_buff_x) * (9.8/1000.0f);
-		accel_filt_asm[1]= (float)mov_avg(N,accel_buff_y) * (9.8/1000.0f);
-		accel_filt_asm[2]= (float)mov_avg(N,accel_buff_z) * (9.8/1000.0f);
-
-
-		// Preprocessing the filtered outputs  The same needs to be done for the output from the assembly program as well
-		float accel_filt_c[3]={0};
-
-		accel_filt_c[0]=(float)mov_avg_C(N,accel_buff_x) * (9.8/1000.0f);
-		accel_filt_c[1]=(float)mov_avg_C(N,accel_buff_y) * (9.8/1000.0f);
-		accel_filt_c[2]=(float)mov_avg_C(N,accel_buff_z) * (9.8/1000.0f);
-
-		/* ---------------------------------------------------------------------------------------------------------- */
+		float yaw = atan2(mag_xyz[0] - deltaX, mag_xyz[1] - deltaY);
+		roll_pitch_yaw[2] = yaw  * 180.0f/M_PI;
+		
+		/* -------------------------------------- UART TRANSMISSION -------------------------------------- */
 		// UART transmission of the results
 
-		char buffer[150]; 									// Create a buffer large enough to hold the text
-
+		char buffer[150]; 								// Create a buffer large enough to hold the text
+		
 		// Transmitting results of C execution over UART
 		if(i>=3)
 		{
@@ -120,7 +188,7 @@ int main(void)
 			// // 1. First printf() Equivalent
 			// sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
 			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
+			
 			// // 2. Second printf() (with Floats) Equivalent
 			// // Note: Requires -u _printf_float to be enabled in Linker settings
 			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
@@ -139,14 +207,13 @@ int main(void)
 			// 		gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
 			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		}
-
-		HAL_Delay(delay_ms);	// 1 second delay
-
-		/* ---------------------------------------------------------------------------------------------------------- */
-		// Fall detection
+		
+		/* -------------------------------------- FALL DETECTION -------------------------------------- */
+		// 
+		fall_event_t fall_event = FALL_EVENT_NONE;
 		if(i>=3) {
-			// fall_event_t fall_event = detect_fall_minimal(accel_filt_asm, gyro_velocity);
-			fall_event_t fall_event = detect_fall_minimal(accel_filt_c, gyro_velocity);
+			fall_event = detect_fall(accel_magnitude_asm, gyro_magnitude_asm, accel_recent_range, gyro_recent_range, roll_pitch_yaw);
+
 			if(fall_event == FALL_EVENT_NEAR_FALL)
 			{
 				sprintf(buffer, "Classification: NEAR-FALL\r\n");
@@ -158,10 +225,144 @@ int main(void)
 				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 			}
 		}
+		#ifdef FALL_DEBUG
+			sprintf(buffer,
+					"FD,acc=%.2f,accR=%.2f,gyro=%.2f,gyroR=%.2f,roll=%.1f,pitch=%.1f,yaw=%.1f,event=%d\r\n",
+					accel_magnitude_asm,
+					accel_recent_range,
+					gyro_magnitude_asm,
+					gyro_recent_range,
+					roll_pitch_yaw[0],
+					roll_pitch_yaw[1],
+					roll_pitch_yaw[2],
+					(int)fall_event);
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+		#endif
+
+
+		/* -------------------------------------- LED BLINKING -------------------------------------- */
+		// Map classification to LED blink rate: slow = normal, medium = near-fall, fast = real fall
+		switch(fall_event)
+		{
+			case FALL_EVENT_REAL_FALL:
+				delay_ms = 100;   // fast blink
+				break;
+			case FALL_EVENT_NEAR_FALL:
+			delay_ms = 250;   // medium blink
+			break;
+			case FALL_EVENT_NONE:
+			default:
+				delay_ms = 500;   // slow blink
+				break;
+		}
+		
+		blink_LED2(delay_ms);
 
 		i++;
 	}
+	
 }
+
+static void init (void)
+{
+	HAL_Init();													// Reset all peripherals, initialize flash interface and systick
+	UART1_Init();												// Initialize UART1 for serial communication
+
+	// Peripheral initializations using BSP functions
+	BSP_LED_Init(LED2);
+	BSP_ACCELERO_Init();
+	BSP_GYRO_Init();
+	BSP_MAGNETO_Init();
+	BSP_LED_Off(LED2);											// Set the initial LED state to off
+}
+
+fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw)
+{
+	// Thresholds to tune experimentally
+	const float ACCEL_RANGE_TH = 3.0f;        // m/s^2, generic instability
+	const float GYRO_RANGE_TH  = 800.0f;      // generic gyro instability
+	// Strong gyro-based impact thresholds for real fall vs normal movements
+	const float GYRO_IMPACT_MAG_TH   = 2000.0f; // strong instantaneous rotation
+	const float GYRO_IMPACT_RANGE_TH = 3500.0f; // strong recent rotation spike
+	const float ROLL_TH = 60.0f; // degrees
+	const float PITCH_TH = 60.0f; // degrees
+	const float YAW_DELTA_TH = 45.0f; // degrees of heading change to consider significant
+
+	// 1) Sudden strong impact: rely mainly on gyro spikes (magnitude or range)
+	bool impact = (gyro_magnitude > GYRO_IMPACT_MAG_TH) || (gyro_range > GYRO_IMPACT_RANGE_TH);
+
+	// 2) Instability: big variation in recent window (softer thresholds)
+	bool unstable = (acc_range > ACCEL_RANGE_TH) || (gyro_range > GYRO_RANGE_TH);
+
+	// 3) Posture: lying vs standing, using roll and pitch only
+	float roll_deg  = roll_pitch_yaw[0];
+	float pitch_deg = roll_pitch_yaw[1];
+	bool lying = (fabsf(roll_deg) > ROLL_TH) || (fabsf(pitch_deg) > PITCH_TH);
+
+	// 4) Yaw: use change in heading as an extra cue for near-fall / twisting motions
+	static float prev_yaw_deg = 0.0f;
+	float yaw_deg = roll_pitch_yaw[2];
+	float yaw_diff = fabsf(yaw_deg - prev_yaw_deg);
+	// Range of -180 to 180, take absolute value and adjust to get range of 0 to 180
+	if (yaw_diff > 180.0f)
+	{
+		yaw_diff = 360.0f - yaw_diff;
+	}
+	prev_yaw_deg = yaw_deg;
+	bool heading_change = (yaw_diff > YAW_DELTA_TH);
+
+	// Real fall: strong impact + lying posture
+	if (impact && lying)
+	{
+		return FALL_EVENT_REAL_FALL;
+	}
+	// Near fall: unstable or impactful, not clearly lying, with noticeable heading change
+	if ((impact || unstable) && !lying && heading_change)
+	{
+		return FALL_EVENT_NEAR_FALL;
+	}
+	return FALL_EVENT_NONE;
+}
+
+// Window used to determine instability based on recent accel/gyro magnitudes. Updated every iteration and used to derive recent range for fall detection. Uses a simple circular buffer approach.
+static void fd_update_windows(float acc_mag, float gyro_mag)
+{
+	acc_mag_window[fd_win_idx]  = acc_mag;
+	gyro_mag_window[fd_win_idx] = gyro_mag;
+	fd_win_idx = (fd_win_idx + 1) % FD_WINDOW_SIZE;
+	if (fd_win_idx == 0)
+	{
+		fd_win_filled = 1;
+	}
+}
+
+static void fd_get_ranges(float *acc_range, float *gyro_range)
+{
+	int count = fd_win_filled ? FD_WINDOW_SIZE : fd_win_idx;
+	if (count <= 0)
+	{
+		*acc_range = 0.0f;
+		*gyro_range = 0.0f;
+		return;
+	}
+
+	float acc_min = acc_mag_window[0];
+	float acc_max = acc_mag_window[0];
+	float gyro_min = gyro_mag_window[0];
+	float gyro_max = gyro_mag_window[0];
+
+	for (int k = 1; k < count; ++k)
+	{
+		if (acc_mag_window[k] < acc_min) acc_min = acc_mag_window[k];
+		if (acc_mag_window[k] > acc_max) acc_max = acc_mag_window[k];
+		if (gyro_mag_window[k] < gyro_min) gyro_min = gyro_mag_window[k];
+		if (gyro_mag_window[k] > gyro_max) gyro_max = gyro_mag_window[k];
+	}
+
+	*acc_range = acc_max - acc_min;
+	*gyro_range = gyro_max - gyro_min;
+}
+
 
 /**
  * @brief  Minimal fall classifier using filtered acceleration and gyro vectors.
@@ -333,7 +534,6 @@ fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro
 			return FALL_EVENT_NONE;
 	}
 }
-
 
 /**
  * @brief  C implementation of the moving average filter. This is a reference implementation and is not optimized for performance.
