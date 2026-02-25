@@ -13,6 +13,7 @@
 
 #include "stdio.h"
 #include "string.h"
+#include "math.h"
 #include <sys/stat.h>
 
 static void UART1_Init(void);
@@ -22,6 +23,15 @@ extern void initialise_monitor_handles(void);	// for semi-hosting support (print
 extern int mov_avg(int N, int* accel_buff); // asm implementation
 
 int mov_avg_C(int N, int* accel_buff); // Reference C implementation
+
+typedef enum
+{
+	FALL_EVENT_NONE = 0,
+	FALL_EVENT_NEAR_FALL,
+	FALL_EVENT_REAL_FALL
+} fall_event_t;
+
+fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3]);
 
 UART_HandleTypeDef huart1;
 
@@ -45,7 +55,7 @@ int main(void)
 	int accel_buff_y[4]={0};
 	int accel_buff_z[4]={0};
 	int i=0;													// Counter to keep track of how many readings have been taken
-	int delay_ms=1000; 											// Change delay time to suit your code
+	int delay_ms=100; 											// Change delay time to suit your code
 
 	while (1)
 	{
@@ -95,50 +105,232 @@ int main(void)
 		// Transmitting results of C execution over UART
 		if(i>=3)
 		{
-			// 1. First printf() Equivalent
-			sprintf(buffer, "Results of C execution for filtered accelerometer readings:\r\n");
-			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// // 1. First printf() Equivalent
+			// sprintf(buffer, "Results of C execution for filtered accelerometer readings:\r\n");
+			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// 2. Second printf() (with Floats) Equivalent
-			// Note: Requires -u _printf_float to be enabled in Linker settings
-			sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
-					accel_filt_c[0], accel_filt_c[1], accel_filt_c[2]);
-			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// // 2. Second printf() (with Floats) Equivalent
+			// // Note: Requires -u _printf_float to be enabled in Linker settings
+			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
+			// 		accel_filt_c[0], accel_filt_c[1], accel_filt_c[2]);
+			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// Transmitting results of asm execution over UART
+			// // Transmitting results of asm execution over UART
 
-			// 1. First printf() Equivalent
-			sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
-			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// // 1. First printf() Equivalent
+			// sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
+			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// 2. Second printf() (with Floats) Equivalent
-			// Note: Requires -u _printf_float to be enabled in Linker settings
-			sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
-					accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
-			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// // 2. Second printf() (with Floats) Equivalent
+			// // Note: Requires -u _printf_float to be enabled in Linker settings
+			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
+			// 		accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
+			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// Transmitting Gyroscope readings over UART
+			// // Transmitting Gyroscope readings over UART
 
-			// 1. First printf() Equivalent
-			sprintf(buffer, "Gyroscope sensor readings:\r\n");
-			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// // 1. First printf() Equivalent
+			// sprintf(buffer, "Gyroscope sensor readings:\r\n");
+			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// 2. Second printf() (with Floats) Equivalent
-			// Note: Requires -u _printf_float to be enabled in Linker settings
-			sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
-					gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
-			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// // 2. Second printf() (with Floats) Equivalent
+			// // Note: Requires -u _printf_float to be enabled in Linker settings
+			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
+			// 		gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
+			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		}
 
 		HAL_Delay(delay_ms);	// 1 second delay
 
-		i++;
-
 		/* ---------------------------------------------------------------------------------------------------------- */
 		// Fall detection
-		// write your program from here:
+		if(i>=3) {
+			// fall_event_t fall_event = detect_fall_minimal(accel_filt_asm, gyro_velocity);
+			fall_event_t fall_event = detect_fall_minimal(accel_filt_c, gyro_velocity);
+			if(fall_event == FALL_EVENT_NEAR_FALL)
+			{
+				sprintf(buffer, "Classification: NEAR-FALL\r\n");
+				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			}
+			else if(fall_event == FALL_EVENT_REAL_FALL)
+			{
+				sprintf(buffer, "Classification: REAL FALL\r\n");
+				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			}
+		}
 
+		i++;
+	}
+}
 
+/**
+ * @brief  Minimal fall classifier using filtered acceleration and gyro vectors.
+ *         Reads directly from accel_filt_asm and gyro_velocity.
+ * @param  accel_filt_asm: Filtered acceleration vector in m/s^2
+ * @param  gyro_velocity: Gyro vector (scaled output)
+ * @return FALL_EVENT_NONE, FALL_EVENT_NEAR_FALL, or FALL_EVENT_REAL_FALL
+ */
+fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3])
+{
+	const float G_NOMINAL = 9.8f;
+	const float STILL_ACCEL_BAND = 1.2f;
+	const float REST_ACCEL_BAND = 0.35f;
+	const float REST_GYRO_TH = 2.2f;
+	const float NEAR_GYRO_TH = 5.5f;
+	const float REAL_GYRO_TH = 8.0f;
+	const float IMPACT_ACCEL_TH = 14.0f;
+	const float FREE_FALL_ACCEL_TH = 4.5f;
+	const float JERK_IMPACT_TH = 5.0f;
+	const float NEAR_JERK_TH = 0.8f;
+
+	typedef enum
+	{
+		DETECT_IDLE = 0,
+		DETECT_WAIT_IMPACT
+	} detect_state_t;
+
+	static detect_state_t state = DETECT_IDLE;
+	static int state_ticks = 0;
+	static int near_fall_score = 0;
+	static int cooldown_ticks = 0;
+
+	static float gyro_bias_x = 0.0f;
+	static float gyro_bias_y = 0.0f;
+	static float gyro_bias_z = 0.0f;
+	static int bias_ready = 0;
+	static int bias_samples = 0;
+
+	static float prev_accel_mag = 9.8f;
+	static float gyro_mag_lpf = 0.0f;
+	static int moving_ticks = 0;
+
+	float ax = accel_filt_asm[0];
+	float ay = accel_filt_asm[1];
+	float az = accel_filt_asm[2];
+
+	float gx_raw = gyro_velocity[0];
+	float gy_raw = gyro_velocity[1];
+	float gz_raw = gyro_velocity[2];
+
+	float accel_mag = sqrtf(ax*ax + ay*ay + az*az);
+	float accel_jerk = fabsf(accel_mag - prev_accel_mag);
+	prev_accel_mag = accel_mag;
+
+	if(!bias_ready)
+	{
+		gyro_bias_x = (gyro_bias_x * bias_samples + gx_raw) / (bias_samples + 1);
+		gyro_bias_y = (gyro_bias_y * bias_samples + gy_raw) / (bias_samples + 1);
+		gyro_bias_z = (gyro_bias_z * bias_samples + gz_raw) / (bias_samples + 1);
+		bias_samples++;
+		if(bias_samples >= 20)
+		{
+			bias_ready = 1;
+		}
+		return FALL_EVENT_NONE;
+	}
+
+	if(fabsf(accel_mag - G_NOMINAL) < STILL_ACCEL_BAND)
+	{
+		const float alpha = 0.01f;
+		gyro_bias_x = (1.0f - alpha) * gyro_bias_x + alpha * gx_raw;
+		gyro_bias_y = (1.0f - alpha) * gyro_bias_y + alpha * gy_raw;
+		gyro_bias_z = (1.0f - alpha) * gyro_bias_z + alpha * gz_raw;
+	}
+
+	float gx = gx_raw - gyro_bias_x;
+	float gy = gy_raw - gyro_bias_y;
+	float gz = gz_raw - gyro_bias_z;
+	float gyro_mag = sqrtf(gx*gx + gy*gy + gz*gz);
+	gyro_mag_lpf = 0.8f * gyro_mag_lpf + 0.2f * gyro_mag;
+
+	if(cooldown_ticks > 0)
+	{
+		cooldown_ticks--;
+		return FALL_EVENT_NONE;
+	}
+
+	switch(state)
+	{
+		case DETECT_IDLE:
+			state_ticks = 0;
+
+			if((fabsf(accel_mag - G_NOMINAL) < REST_ACCEL_BAND) && (gyro_mag_lpf < REST_GYRO_TH))
+			{
+				near_fall_score = 0;
+				moving_ticks = 0;
+				return FALL_EVENT_NONE;
+			}
+
+			if(moving_ticks < 20)
+			{
+				moving_ticks++;
+			}
+
+			if(((accel_mag < FREE_FALL_ACCEL_TH) && (gyro_mag_lpf > NEAR_GYRO_TH)) ||
+			   ((accel_mag > IMPACT_ACCEL_TH) && (gyro_mag_lpf > REAL_GYRO_TH)) ||
+			   ((accel_jerk > JERK_IMPACT_TH) && (gyro_mag_lpf > REAL_GYRO_TH)))
+			{
+				state = DETECT_WAIT_IMPACT;
+				state_ticks = 0;
+				near_fall_score = 0;
+				return FALL_EVENT_NONE;
+			}
+
+			if((moving_ticks >= 3) &&
+			   (gyro_mag_lpf > NEAR_GYRO_TH) && (gyro_mag_lpf < REAL_GYRO_TH) &&
+			   (accel_mag > (G_NOMINAL - 2.5f)) && (accel_mag < IMPACT_ACCEL_TH) &&
+			   (accel_jerk > NEAR_JERK_TH))
+			{
+				if(near_fall_score < 8)
+				{
+					near_fall_score++;
+				}
+			}
+			else if(near_fall_score > 1)
+			{
+				near_fall_score -= 2;
+			}
+			else
+			{
+				near_fall_score = 0;
+			}
+
+			if(near_fall_score >= 8)
+			{
+				near_fall_score = 0;
+				cooldown_ticks = 20;
+				return FALL_EVENT_NEAR_FALL;
+			}
+
+			return FALL_EVENT_NONE;
+
+		case DETECT_WAIT_IMPACT:
+			state_ticks++;
+
+			if(((accel_mag > IMPACT_ACCEL_TH) && (gyro_mag_lpf > REAL_GYRO_TH)) ||
+			   ((accel_jerk > JERK_IMPACT_TH) && (gyro_mag_lpf > REAL_GYRO_TH)))
+			{
+				state = DETECT_IDLE;
+				state_ticks = 0;
+				cooldown_ticks = 30;
+				return FALL_EVENT_REAL_FALL;
+			}
+
+			if(state_ticks > 10)
+			{
+				state = DETECT_IDLE;
+				cooldown_ticks = 20;
+				return FALL_EVENT_NEAR_FALL;
+			}
+
+			return FALL_EVENT_NONE;
+
+		default:
+			state = DETECT_IDLE;
+			state_ticks = 0;
+			near_fall_score = 0;
+			cooldown_ticks = 0;
+			return FALL_EVENT_NONE;
 	}
 }
 
