@@ -10,11 +10,13 @@
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
+#include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01.h"
 
 #include "stdio.h"
 #include "string.h"
 #include "math.h"
 #include <sys/stat.h>
+#include <stdbool.h>
 
 static void UART1_Init(void);
 
@@ -50,15 +52,20 @@ int main(void)
 	BSP_GYRO_Init();
 
 	BSP_LED_Off(LED2);											// Set the initial LED state to off
+	BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);					// Initialize the user button (not used in this code but can be useful for future extensions)
 
 	int accel_buff_x[4]={0};
 	int accel_buff_y[4]={0};
 	int accel_buff_z[4]={0};
 	int i=0;													// Counter to keep track of how many readings have been taken
 	int delay_ms=100; 											// Change delay time to suit your code
+	const int button_reset_ticks_required = 2;
 
-	while (1)
-	{
+	bool fallDetected = false;									// Flag to indicate if a fall has been detected
+	int button_press_ticks = 0;
+	bool button_reset_armed = true;
+
+	while (1) {
 		BSP_LED_Toggle(LED2);									// This function helps to toggle the current LED state
 
 		int16_t accel_data_i16[3] = { 0 };						// Array to store the x, y and z readings of accelerometer
@@ -100,11 +107,10 @@ int main(void)
 		/* ---------------------------------------------------------------------------------------------------------- */
 		// UART transmission of the results
 
-		char buffer[150]; 									// Create a buffer large enough to hold the text
+		char buffer[150]; 										// Create a buffer large enough to hold the text
 
 		// Transmitting results of C execution over UART
-		if(i>=3)
-		{
+		if(i>=3 && !fallDetected) {								// Start transmitting only after we have enough readings to fill the buffer and if a fall has not been detected yet
 			// // 1. First printf() Equivalent
 			// sprintf(buffer, "Results of C execution for filtered accelerometer readings:\r\n");
 			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
@@ -115,51 +121,71 @@ int main(void)
 			// 		accel_filt_c[0], accel_filt_c[1], accel_filt_c[2]);
 			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// // Transmitting results of asm execution over UART
+			// Transmitting results of asm execution over UART
 
-			// // 1. First printf() Equivalent
-			// sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// 1. First printf() Equivalent
+			sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// // 2. Second printf() (with Floats) Equivalent
-			// // Note: Requires -u _printf_float to be enabled in Linker settings
-			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
-			// 		accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// 2. Second printf() (with Floats) Equivalent
+			// Note: Requires -u _printf_float to be enabled in Linker settings
+			sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
+					accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// // Transmitting Gyroscope readings over UART
+			// Transmitting Gyroscope readings over UART
 
-			// // 1. First printf() Equivalent
-			// sprintf(buffer, "Gyroscope sensor readings:\r\n");
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// 1. First printf() Equivalent
+			sprintf(buffer, "Gyroscope sensor readings:\r\n");
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 
-			// // 2. Second printf() (with Floats) Equivalent
-			// // Note: Requires -u _printf_float to be enabled in Linker settings
-			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
-			// 		gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			// 2. Second printf() (with Floats) Equivalent
+			// Note: Requires -u _printf_float to be enabled in Linker settings
+			sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
+					gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		}
 
 		HAL_Delay(delay_ms);	// 1 second delay
 
 		/* ---------------------------------------------------------------------------------------------------------- */
 		// Fall detection
-		if(i>=3) {
+		if(i>=3 && !fallDetected) {
 			// fall_event_t fall_event = detect_fall_minimal(accel_filt_asm, gyro_velocity);
 			fall_event_t fall_event = detect_fall_minimal(accel_filt_c, gyro_velocity);
 			if(fall_event == FALL_EVENT_NEAR_FALL)
 			{
 				sprintf(buffer, "Classification: NEAR-FALL\r\n");
 				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+				fallDetected = true;
 			}
 			else if(fall_event == FALL_EVENT_REAL_FALL)
 			{
 				sprintf(buffer, "Classification: REAL FALL\r\n");
 				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+				fallDetected = true;
 			}
 		}
+		if (fallDetected) {
+			blink_LED2(500); // Blink LED2 every 500ms to indicate a fall has been detected
+		}
+		if (BSP_PB_GetState(BUTTON_USER) == GPIO_PIN_SET) {
+			if(button_press_ticks < button_reset_ticks_required) {
+				button_press_ticks++;
+			}
+			if(button_reset_armed && button_press_ticks >= button_reset_ticks_required) {
+				fallDetected = false;
+				BSP_LED_Off(LED2);
+				button_reset_armed = false;
+			}
+		} else {
+			button_press_ticks = 0;
+			button_reset_armed = true;
+		}
 
-		i++;
+		if(i < 4) {
+			i++;
+		}
 	}
 }
 
