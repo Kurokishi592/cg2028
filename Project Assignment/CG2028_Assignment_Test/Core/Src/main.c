@@ -34,9 +34,9 @@ int main(void)
 
 	/*********************************************************/
 
-	int sensor_data_x[16]={1000,1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,1015};
-	int sensor_data_y[16]={1016.1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1027,1028,1029.1030,1031};
-	int sensor_data_z[16]={1032,1033,1034,1035,1036,1037,1038,1039,1040,1041,1042,1043,1044,1045,1046,1047};
+	int sensor_data_x[16]={6030,6000,4389,4488,6734,5009,7318,6040,5000,5643,3888,3488,3488,3488,4876,5010};
+	int sensor_data_y[16]={9800,9800,6573,6753,5004,5895,4321,6753,9004,3005,6934,4444,7981,5144,5867,4178};
+	int sensor_data_z[16]={5455,6177,8653,7777,6520,4566,7860,5199,6233,5444,9822,3455,6445,7888,4113,4998};
 
 
 	/*********************************************************/
@@ -78,16 +78,15 @@ int main(void)
 		filt_avg_asm[0]=mov_avg(N,accel_buff_x);
 		filt_avg_asm[1]=mov_avg(N,accel_buff_y);
 		filt_avg_asm[2]=mov_avg(N,accel_buff_z);
-
+		printf("Expected result (X): %d, Current result: %d \n", filt_avg_c[0],filt_avg_asm[0]);
+					printf("Expected result (Y): %d, Current result: %d \n", filt_avg_c[1],filt_avg_asm[1]);
+					printf("Expected result (Z): %d, Current result: %d \n", filt_avg_c[2],filt_avg_asm[2]);
 		//Check whether the returned values of the assembly and the C code are the same
 		if( (filt_avg_asm[0]!=filt_avg_c[0]) ||
-			(filt_avg_asm[2]!=filt_avg_c[2]) ||
-			(filt_avg_asm[3]!=filt_avg_c[3]) )
+			(filt_avg_asm[1]!=filt_avg_c[1]) ||
+			(filt_avg_asm[2]!=filt_avg_c[2]) )
 		{
 			printf("Assembly and C values mismatch\n");
-			printf("Expected result (X): %d, Current result: %d \n", filt_avg_c[0],filt_avg_asm[0]);
-			printf("Expected result (Y): %d, Current result: %d \n", filt_avg_c[1],filt_avg_asm[1]);
-			printf("Expected result (Z): %d, Current result: %d \n", filt_avg_c[2],filt_avg_asm[2]);
 			flag=0;
 			break;
 		}
