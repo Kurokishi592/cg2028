@@ -552,9 +552,28 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 			if (lying_down_ticks >= LYING_DOWN_TICKS_MIN)
 			{
 				// Sequence: upright -> falling -> lying still for a while => real fall
-				g_fall_phase = PHASE_UPRIGHT; // will not re-trigger until back upright
+				// g_fall_phase = PHASE_UPRIGHT; // will not re-trigger until back upright
 				result = FALL_EVENT_REAL_FALL;
 				phase_ticks = 0;
+
+				// Button press to manually reset state after a real fall
+				bool reset = false;
+				int button_press_ticks = 0, button_reset_ticks_required = 2, button_reset_armed = false;
+				while (!reset) {
+					if (BSP_PB_GetState(BUTTON_USER) == GPIO_PIN_SET) {
+						if(button_press_ticks < button_reset_ticks_required) {
+							button_press_ticks++;
+						}
+						if(button_reset_armed && button_press_ticks >= button_reset_ticks_required) {
+							g_fall_phase = PHASE_UPRIGHT;
+							reset = true;
+							button_reset_armed = false;
+						}
+					} else {
+						button_press_ticks = 0;
+						button_reset_armed = true;
+					}
+				}
 				break;
 			}
 		}
