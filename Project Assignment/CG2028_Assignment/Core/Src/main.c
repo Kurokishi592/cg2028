@@ -39,6 +39,11 @@ typedef enum
 	FALL_EVENT_REAL_FALL = 2
 } fall_event_t;
 
+// Internal fall-detection state machine phases (for debugging/inspection)
+typedef enum { PHASE_UPRIGHT = 0, PHASE_FALLING, PHASE_POSTFALL } fall_phase_t;
+
+static fall_phase_t g_fall_phase = PHASE_UPRIGHT;
+
 fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3]);
 fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw);
 
@@ -227,7 +232,7 @@ int main(void)
 		}
 		#ifdef FALL_DEBUG
 			sprintf(buffer,
-					"FD,acc=%.2f,accR=%.2f,gyro=%.2f,gyroR=%.2f,roll=%.1f,pitch=%.1f,yaw=%.1f,event=%d\r\n",
+					"FD,acc=%.2f,accR=%.2f,gyro=%.2f,gyroR=%.2f,roll=%.1f,pitch=%.1f,yaw=%.1f,state=%d\r\n",
 					accel_magnitude_asm,
 					accel_recent_range,
 					gyro_magnitude_asm,
@@ -235,7 +240,7 @@ int main(void)
 					roll_pitch_yaw[0],
 					roll_pitch_yaw[1],
 					roll_pitch_yaw[2],
-					(int)fall_event);
+					fall_get_state());
 			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		#endif
 
@@ -276,52 +281,130 @@ static void init (void)
 	BSP_LED_Off(LED2);											// Set the initial LED state to off
 }
 
+int fall_get_state(void)
+{
+	return (int)g_fall_phase;
+}
+
 fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw)
 {
-	// Thresholds to tune experimentally
-	const float ACCEL_RANGE_TH = 3.0f;        // m/s^2, generic instability
-	const float GYRO_RANGE_TH  = 800.0f;      // generic gyro instability
-	// Strong gyro-based impact thresholds for real fall vs normal movements
-	const float GYRO_IMPACT_MAG_TH   = 2000.0f; // strong instantaneous rotation
-	const float GYRO_IMPACT_RANGE_TH = 3500.0f; // strong recent rotation spike
-	const float ROLL_TH = 60.0f; // degrees
-	const float PITCH_TH = 60.0f; // degrees
-	const float YAW_DELTA_TH = 45.0f; // degrees of heading change to consider significant
+	/* Parameters to be tuned */
+	const float G_NOMINAL          = G;
+	const float UPRIGHT_PITCH_MIN  = 60.0f;   // |pitch| above this -> upright-ish
+	const float LYING_PITCH_MAX    = 40.0f;   // |pitch| below this -> lying-ish
+	const float MOVE_GYRO_TH       = 150.0f;  // basic "moving" threshold
+	const float BIG_GYRO_TH        = 1600.0f; // strong rotation -> potential fall
+	const float FREEFALL_LOW_TH    = 7.0f;    // accel magnitude much lower than 1g
+	const float ACC_DELTA_FALL_TH  = 3.0f;    // big change between samples
+	const int   FALLING_MAX_TICKS  = 3;      // max samples to stay in FALLING
+	const int   LYING_DOWN_TICKS_MIN = 3;     // required lying+still samples
+	const int   POSTFALL_MAX_TICKS = 10;      // max samples to stay in POSTFALL
 
-	// 1) Sudden strong impact: rely mainly on gyro spikes (magnitude or range)
-	bool impact = (gyro_magnitude > GYRO_IMPACT_MAG_TH) || (gyro_range > GYRO_IMPACT_RANGE_TH);
-
-	// 2) Instability: big variation in recent window (softer thresholds)
-	bool unstable = (acc_range > ACCEL_RANGE_TH) || (gyro_range > GYRO_RANGE_TH);
-
-	// 3) Posture: lying vs standing, using roll and pitch only
-	float roll_deg  = roll_pitch_yaw[0];
+	// These are to identify the orientation and movements of the board.
 	float pitch_deg = roll_pitch_yaw[1];
-	bool lying = (fabsf(roll_deg) > ROLL_TH) || (fabsf(pitch_deg) > PITCH_TH);
+	bool upright_now = (fabsf(pitch_deg) > UPRIGHT_PITCH_MIN);
+	bool lying_now   = (fabsf(pitch_deg) < LYING_PITCH_MAX);
+	bool moving_now  = (gyro_magnitude > MOVE_GYRO_TH);
+	bool big_gyro_now = (gyro_magnitude > BIG_GYRO_TH);
 
-	// 4) Yaw: use change in heading as an extra cue for near-fall / twisting motions
-	static float prev_yaw_deg = 0.0f;
-	float yaw_deg = roll_pitch_yaw[2];
-	float yaw_diff = fabsf(yaw_deg - prev_yaw_deg);
-	// Range of -180 to 180, take absolute value and adjust to get range of 0 to 180
-	if (yaw_diff > 180.0f)
-	{
-		yaw_diff = 360.0f - yaw_diff;
-	}
-	prev_yaw_deg = yaw_deg;
-	bool heading_change = (yaw_diff > YAW_DELTA_TH);
+	// To differentiate between normal activity, use strong change:
+	static float prev_acc_mag = 9.8f;
+	static float prev_pitch_deg = 0.0f;
+	float acc_delta   = fabsf(acc_magnitude - prev_acc_mag);
+	float pitch_delta = fabsf(pitch_deg - prev_pitch_deg);
+	bool freefall_like = (acc_magnitude < FREEFALL_LOW_TH);
+	bool strong_change = big_gyro_now || freefall_like || (acc_delta > ACC_DELTA_FALL_TH) || (pitch_delta > 15.0f);
+	static bool trigger_by_gyro = 0;
 
-	// Real fall: strong impact + lying posture
-	if (impact && lying)
+	// To keep track of how long we've been in each phase, use counters that reset on phase change
+	static int phase_ticks = 0;
+	static int lying_down_ticks = 0;
+
+	fall_event_t result = FALL_EVENT_NONE;
+
+	// Use state machine to differentiate between near fall and real fall
+	switch (g_fall_phase)
 	{
-		return FALL_EVENT_REAL_FALL;
+	case PHASE_UPRIGHT:
+		// Normal upright/sitting: small motion allowed, no impact
+		// Start falling phase only from upright posture
+		if (upright_now)
+		{
+			phase_ticks++; // we are only interested in how long we are upright
+			if (strong_change && phase_ticks > 2)
+			{
+				trigger_by_gyro = big_gyro_now;
+				g_fall_phase = PHASE_FALLING;
+				phase_ticks = 0;
+			}
+
+		}
+		break;
+
+	case PHASE_FALLING:
+		phase_ticks++;
+		// Transition to post-fall when we reach lying orientation and it was due to a huge rotation
+		if (lying_now && trigger_by_gyro)
+		{
+			g_fall_phase = PHASE_POSTFALL;
+			phase_ticks = 0;
+			lying_down_ticks = 1;
+			break;
+		}
+		// Recovered without lying -> near-fall
+		// If falling phase lasts too long without lying, treat as none and reset
+		if (phase_ticks >= FALLING_MAX_TICKS)
+		{
+			g_fall_phase = PHASE_UPRIGHT;
+			result = FALL_EVENT_NEAR_FALL;
+			phase_ticks = 0;
+		}
+		break;
+
+	case PHASE_POSTFALL:
+		phase_ticks++;
+		if (lying_now)
+		{
+			lying_down_ticks++;
+			if (lying_down_ticks >= LYING_DOWN_TICKS_MIN)
+			{
+				// Sequence: upright -> falling -> lying still for a while => real fall
+				g_fall_phase = PHASE_UPRIGHT; // will not re-trigger until back upright
+				result = FALL_EVENT_REAL_FALL;
+				phase_ticks = 0;
+				break;
+			}
+		}
+		else
+		{
+			// If we move out of lying quickly (stand up or roll), classify as near-fall
+			if (phase_ticks > 2 || upright_now)
+			{
+				g_fall_phase = PHASE_UPRIGHT;
+				result = FALL_EVENT_NEAR_FALL;
+				phase_ticks = 0;
+				break;
+			}
+		}
+		// If we stay too long in ambiguous post-fall without settling, reset
+		if (phase_ticks >= POSTFALL_MAX_TICKS)
+		{
+			g_fall_phase = PHASE_UPRIGHT;
+			result = FALL_EVENT_NEAR_FALL;
+			phase_ticks = 0;
+		}
+		break;
+
+	default:
+		g_fall_phase = PHASE_UPRIGHT;
+		break;
 	}
-	// Near fall: unstable or impactful, not clearly lying, with noticeable heading change
-	if ((impact || unstable) && !lying && heading_change)
-	{
-		return FALL_EVENT_NEAR_FALL;
-	}
-	return FALL_EVENT_NONE;
+
+	// Update previous-sample features
+	prev_acc_mag = acc_magnitude;
+	prev_pitch_deg = pitch_deg;
+
+	return result;
 }
 
 // Window used to determine instability based on recent accel/gyro magnitudes. Updated every iteration and used to derive recent range for fall detection. Uses a simple circular buffer approach.
