@@ -1,5 +1,7 @@
 #include "wifi_service2.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -8,17 +10,16 @@
 #include "../../Drivers/BSP/Components/es_wifi/es_wifi.h"
 
 #define WIFI2_IO_TIMEOUT_MS      4000U
-#define WIFI2_SEND_TIMEOUT_MS    5000U
+#define WIFI2_SEND_TIMEOUT_MS    9000U
 #define WIFI2_INIT_DELAY_MS      300U
 #define WIFI2_CONNECT_DELAY_MS   300U
+#define WIFI2_SOCKET_SETTLE_MS   1000U
+#define WIFI2_POST_SEND_DELAY_MS 80U
 #define WIFI2_RESET_PULSE_MS     10U
 #define WIFI2_RESET_SETTLE_MS    500U
 
-#define WIFI2_SERVER_IP0         192U
-#define WIFI2_SERVER_IP1         168U
-#define WIFI2_SERVER_IP2         1U
-#define WIFI2_SERVER_IP3         103U
-#define WIFI2_SERVER_PORT        5000U
+#define WIFI2_SERVER_HOST        ESP32_PROXY_HOST
+#define WIFI2_SERVER_PORT        ESP32_PROXY_PORT
 
 #define WIFI2_ERR_BAD_ARG        -1
 #define WIFI2_ERR_BUS            -2
@@ -32,6 +33,30 @@ static ES_WIFIObject_t es;
 static uint8_t wifi2_bus_registered = 0;
 static uint8_t wifi2_ready = 0;
 static uint8_t wifi2_connected = 0;
+
+extern UART_HandleTypeDef huart1;
+
+static void WIFI2_Log(const char *fmt, ...)
+{
+    char line[160];
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (written <= 0) {
+        return;
+    }
+
+    size_t line_len = strnlen(line, sizeof(line));
+    if ((line_len + 2U) < sizeof(line)) {
+        line[line_len] = '\r';
+        line[line_len + 1U] = '\n';
+        line[line_len + 2U] = '\0';
+        line_len += 2U;
+    }
+
+    HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)line_len, 200U);
+}
 
 static uint32_t WIFI2_ClampTimeout(uint32_t timeout)
 {
@@ -255,6 +280,11 @@ static void WIFI2_IO_Delay(uint32_t ms)
 int WIFI2_Init(void)
 {
     int8_t status;
+    static const ES_WIFI_SecurityType_t sec_try[] = {
+        ES_WIFI_SEC_WPA2,
+        ES_WIFI_SEC_WPA_WPA2,
+        ES_WIFI_SEC_WPA
+    };
 
     if (!wifi2_bus_registered) {
         status = ES_WIFI_RegisterBusIO(&es,
@@ -278,13 +308,22 @@ int WIFI2_Init(void)
         HAL_Delay(WIFI2_INIT_DELAY_MS);
     }
 
+    wifi2_connected = ES_WIFI_IsConnected(&es) ? 1U : 0U;
+
     if (!wifi2_connected) {
-        status = ES_WIFI_Connect(&es, WIFI_SECRET_SSID, WIFI_SECRET_PASSWORD, ES_WIFI_SEC_WPA2);
-        if (status != ES_WIFI_STATUS_OK) {
+        for (uint8_t sec_idx = 0; sec_idx < (uint8_t)(sizeof(sec_try) / sizeof(sec_try[0])); ++sec_idx) {
+            status = ES_WIFI_Connect(&es, WIFI_SSID, WIFI_PASSWORD, sec_try[sec_idx]);
+            if (status == ES_WIFI_STATUS_OK) {
+                HAL_Delay(WIFI2_CONNECT_DELAY_MS);
+                if (ES_WIFI_IsConnected(&es)) {
+                    wifi2_connected = 1U;
+                    break;
+                }
+            }
+        }
+        if (!wifi2_connected) {
             return WIFI2_ERR_CONNECT_AP;
         }
-        wifi2_connected = 1;
-        HAL_Delay(WIFI2_CONNECT_DELAY_MS);
     }
 
     return 0;
@@ -301,40 +340,193 @@ int WIFI2_SendTcp(const char *message)
         return init_status;
     }
 
-    uint16_t msg_len = (uint16_t)strlen(message);
-    if (msg_len == 0U) {
+    uint16_t message_len = (uint16_t)strlen(message);
+    if (message_len == 0U) {
         return 0;
     }
 
-    ES_WIFI_Conn_t conn;
-    memset(&conn, 0, sizeof(conn));
-    conn.Number = 1;
-    conn.Type = ES_WIFI_TCP_CONNECTION;
-    conn.LocalPort = 0;
-    conn.RemotePort = WIFI2_SERVER_PORT;
-    conn.RemoteIP[0] = WIFI2_SERVER_IP0;
-    conn.RemoteIP[1] = WIFI2_SERVER_IP1;
-    conn.RemoteIP[2] = WIFI2_SERVER_IP2;
-    conn.RemoteIP[3] = WIFI2_SERVER_IP3;
+    uint8_t payload[128];
+    if (message_len >= (uint16_t)(sizeof(payload) - 1U)) {
+        return WIFI2_ERR_BAD_ARG;
+    }
+    memcpy(payload, message, message_len);
+    payload[message_len] = '\n';
+    uint16_t msg_len = (uint16_t)(message_len + 1U);
 
-    (void)ES_WIFI_StopClientConnection(&es, &conn);
-    if (ES_WIFI_StartClientConnection(&es, &conn) != ES_WIFI_STATUS_OK) {
-        return WIFI2_ERR_TCP_OPEN;
+    uint8_t remote_ip[4] = {0};
+    unsigned int a = 0;
+    unsigned int b = 0;
+    unsigned int c = 0;
+    unsigned int d = 0;
+    char tail = '\0';
+    if (sscanf(WIFI2_SERVER_HOST, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4) {
+        if ((a > 255U) || (b > 255U) || (c > 255U) || (d > 255U)) {
+            return WIFI2_ERR_BAD_ARG;
+        }
+        remote_ip[0] = (uint8_t)a;
+        remote_ip[1] = (uint8_t)b;
+        remote_ip[2] = (uint8_t)c;
+        remote_ip[3] = (uint8_t)d;
+    } else {
+        int8_t dns_status = ES_WIFI_DNS_LookUp(&es, WIFI2_SERVER_HOST, remote_ip);
+        if (dns_status != ES_WIFI_STATUS_OK) {
+            WIFI2_Log("WIFI2 DNS fail host=%s es=%d", WIFI2_SERVER_HOST, (int)dns_status);
+            return WIFI2_ERR_TCP_OPEN;
+        }
     }
 
-    uint16_t sent_len = 0;
-    int8_t send_status = ES_WIFI_SendData(&es,
-                                          conn.Number,
-                                          (uint8_t *)message,
-                                          msg_len,
-                                          &sent_len,
-                                          WIFI2_SEND_TIMEOUT_MS);
+    WIFI2_Log("WIFI2 TCP dst=%u.%u.%u.%u:%u",
+              (unsigned int)remote_ip[0],
+              (unsigned int)remote_ip[1],
+              (unsigned int)remote_ip[2],
+              (unsigned int)remote_ip[3],
+              (unsigned int)WIFI2_SERVER_PORT);
 
-    (void)ES_WIFI_StopClientConnection(&es, &conn);
+    static const uint8_t socket_try[] = {0U, 1U};
 
-    if ((send_status != ES_WIFI_STATUS_OK) || (sent_len < msg_len)) {
-        return WIFI2_ERR_TCP_SEND;
+    for (uint8_t k = 0; k < (uint8_t)(sizeof(socket_try) / sizeof(socket_try[0])); ++k) {
+        ES_WIFI_Conn_t conn;
+        memset(&conn, 0, sizeof(conn));
+        conn.Number = socket_try[k];
+        conn.Type = ES_WIFI_TCP_CONNECTION;
+        conn.LocalPort = 0;
+        conn.RemotePort = WIFI2_SERVER_PORT;
+        conn.RemoteIP[0] = remote_ip[0];
+        conn.RemoteIP[1] = remote_ip[1];
+        conn.RemoteIP[2] = remote_ip[2];
+        conn.RemoteIP[3] = remote_ip[3];
+
+        (void)ES_WIFI_StopClientConnection(&es, &conn);
+        int8_t open_status = ES_WIFI_StartClientConnection(&es, &conn);
+        if (open_status != ES_WIFI_STATUS_OK) {
+            WIFI2_Log("WIFI2 TCP open fail s=%u es=%d", (unsigned int)conn.Number, (int)open_status);
+            if (k == 0U) {
+                wifi2_connected = 0U;
+                init_status = WIFI2_Init();
+                if (init_status != 0) {
+                    WIFI2_Log("WIFI2 TCP open fail (reinit=%d)", init_status);
+                    return WIFI2_ERR_TCP_OPEN;
+                }
+            }
+            continue;
+        }
+
+        WIFI2_Log("WIFI2 TCP open ok s=%u", (unsigned int)conn.Number);
+
+        HAL_Delay(WIFI2_SOCKET_SETTLE_MS);
+
+        uint16_t sent_len = 0;
+        int8_t send_status = ES_WIFI_SendData(&es,
+                                              conn.Number,
+                                              payload,
+                                              msg_len,
+                                              &sent_len,
+                                              WIFI2_SEND_TIMEOUT_MS);
+
+        if ((send_status != ES_WIFI_STATUS_OK) && (sent_len < msg_len)) {
+            uint16_t remaining = (uint16_t)(msg_len - sent_len);
+            uint16_t sent_retry = 0;
+
+            HAL_Delay(150);
+            send_status = ES_WIFI_SendData(&es,
+                                           conn.Number,
+                                           &payload[sent_len],
+                                           remaining,
+                                           &sent_retry,
+                                           WIFI2_SEND_TIMEOUT_MS);
+            sent_len = (uint16_t)(sent_len + sent_retry);
+        }
+
+        if ((send_status != ES_WIFI_STATUS_OK) && (sent_len < msg_len)) {
+            uint16_t remaining = (uint16_t)(msg_len - sent_len);
+            uint16_t sent_retry2 = 0;
+
+            HAL_Delay(200);
+            send_status = ES_WIFI_SendData(&es,
+                                           conn.Number,
+                                           &payload[sent_len],
+                                           remaining,
+                                           &sent_retry2,
+                                           WIFI2_SEND_TIMEOUT_MS);
+            sent_len = (uint16_t)(sent_len + sent_retry2);
+        }
+
+        HAL_Delay(WIFI2_POST_SEND_DELAY_MS);
+        (void)ES_WIFI_StopClientConnection(&es, &conn);
+
+        if (sent_len >= msg_len) {
+            WIFI2_Log("WIFI2 TCP ok s=%u es=%d sent=%u/%u",
+                      (unsigned int)conn.Number,
+                      (int)send_status,
+                      (unsigned int)sent_len,
+                      (unsigned int)msg_len);
+            return 0;
+        }
+
+        WIFI2_Log("WIFI2 TCP fail s=%u es=%d sent=%u/%u",
+                  (unsigned int)conn.Number,
+                  (int)send_status,
+                  (unsigned int)sent_len,
+                  (unsigned int)msg_len);
+
+        if ((send_status == ES_WIFI_STATUS_ERROR) && (sent_len == 0U)) {
+            (void)ES_WIFI_Disconnect(&es);
+            HAL_Delay(250);
+            wifi2_connected = 0U;
+            init_status = WIFI2_Init();
+            if (init_status == 0) {
+                open_status = ES_WIFI_StartClientConnection(&es, &conn);
+                if (open_status == ES_WIFI_STATUS_OK) {
+                    HAL_Delay(WIFI2_SOCKET_SETTLE_MS);
+                    sent_len = 0;
+                    send_status = ES_WIFI_SendData(&es,
+                                                   conn.Number,
+                                                   payload,
+                                                   msg_len,
+                                                   &sent_len,
+                                                   WIFI2_SEND_TIMEOUT_MS);
+                    HAL_Delay(WIFI2_POST_SEND_DELAY_MS);
+                    (void)ES_WIFI_StopClientConnection(&es, &conn);
+                    if (sent_len >= msg_len) {
+                        WIFI2_Log("WIFI2 TCP recover ok s=%u es=%d sent=%u/%u",
+                                  (unsigned int)conn.Number,
+                                  (int)send_status,
+                                  (unsigned int)sent_len,
+                                  (unsigned int)msg_len);
+                        return 0;
+                    }
+                    WIFI2_Log("WIFI2 TCP recover fail s=%u es=%d sent=%u/%u",
+                              (unsigned int)conn.Number,
+                              (int)send_status,
+                              (unsigned int)sent_len,
+                              (unsigned int)msg_len);
+                }
+            }
+        }
     }
 
-    return 0;
+    uint16_t sent_to_len = 0;
+    int8_t send_to_status = ES_WIFI_SendDataTo(&es,
+                                               0,
+                                               payload,
+                                               msg_len,
+                                               &sent_to_len,
+                                               WIFI2_SEND_TIMEOUT_MS,
+                                               remote_ip,
+                                               WIFI2_SERVER_PORT);
+    if (sent_to_len >= msg_len) {
+        WIFI2_Log("WIFI2 TCP alt ok es=%d sent=%u/%u",
+                  (int)send_to_status,
+                  (unsigned int)sent_to_len,
+                  (unsigned int)msg_len);
+        return 0;
+    }
+
+    WIFI2_Log("WIFI2 TCP alt fail es=%d sent=%u/%u",
+              (int)send_to_status,
+              (unsigned int)sent_to_len,
+              (unsigned int)msg_len);
+
+    wifi2_connected = 0U;
+    return WIFI2_ERR_TCP_SEND;
 }
