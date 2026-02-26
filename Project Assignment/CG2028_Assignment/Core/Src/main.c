@@ -48,8 +48,8 @@ extern int mov_avg(int N, int* accel_buff); // asm implementation
 int mov_avg_C(int N, int* accel_buff); // Reference C implementation
 int fall_get_state(void);
 void SPI_WIFI_ISR(void);
+void SystemClock_Config(void);
 
-static SPI_HandleTypeDef hspi3;
 
 typedef enum
 {
@@ -308,71 +308,8 @@ int main(void)
 				delay_ms = 500;   // slow blink
 				break;
 		}
-		
 		blink_LED2(delay_ms);
-
-		
-
 		i++;
-	}
-	
-}
-
-static void RF_GPIO_Init() {
-    GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-
-    /* GPIO Ports Clock Enable */
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_GPIOE_CLK_ENABLE();
-
-    /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(SPSGRF_915_SDN_GPIO_Port, SPSGRF_915_SDN_Pin, GPIO_PIN_RESET);
-
-    /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(SPSGRF_915_SPI3_CSN_GPIO_Port, SPSGRF_915_SPI3_CSN_Pin, GPIO_PIN_SET);
-
-    /*Configure GPIO pins : Shutdown Pin on SPSGRF SDN */
-    GPIO_InitStruct.Pin = SPSGRF_915_SDN_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(SPSGRF_915_SDN_GPIO_Port, &GPIO_InitStruct);
-
-    /*Configure GPIO pin : SPSGRF CS */
-    GPIO_InitStruct.Pin = SPSGRF_915_SPI3_CSN_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(SPSGRF_915_SPI3_CSN_GPIO_Port, &GPIO_InitStruct);
-
-    /*Configure GPIO pin : SPSGRF GPIO3 for EXTI */
-    GPIO_InitStruct.Pin = SPSGRF_915_GPIO3_EXTI5_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(SPSGRF_915_GPIO3_EXTI5_GPIO_Port, &GPIO_InitStruct);
-
-    /* EXTI interrupt init*/
-	HAL_NVIC_SetPriority(SPSGRF_915_GPIO3_EXTI5_EXTI_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(SPSGRF_915_GPIO3_EXTI5_EXTI_IRQn);
-}
-
-static void RF_SPI3_Init() {
-    hspi3.Instance = SPI3;
-    hspi3.Init.Mode = SPI_MODE_MASTER;
-    hspi3.Init.Direction = SPI_DIRECTION_2LINES;
-    hspi3.Init.DataSize = SPI_DATASIZE_4BIT;
-    hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
-    hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
-    hspi3.Init.NSS = SPI_NSS_SOFT;
-    hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-    hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
-    hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
-    hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-    hspi3.Init.CRCPolynomial = 7;
-    hspi3.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-	hspi3.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-    if (HAL_SPI_Init(&hspi3) != HAL_OK) {
-    	Error_Handler();
 	}
 }
 
@@ -475,39 +412,25 @@ static int WIFI_AppSendText(const char *text)
 	}
 
 	uint16_t sent_len = 0;
-	WIFI_Status_t status = WIFI_SendData(g_wifi_socket,
-									   payload,
-									   (uint16_t)n,
-									   &sent_len,
-									   7000U);
+	WIFI_Status_t status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, 7000U);
 
 	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
 		return 0;
 	}
 
 	(void)WIFI_CloseClientConnection(g_wifi_socket);
-	status = WIFI_OpenClientConnection(g_wifi_socket,
-									  WIFI_TCP_PROTOCOL,
-									  "conn",
-									  g_wifi_server_ip,
-									  ESP32_PROXY_PORT,
-									  0);
+	status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
 	if (status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return -12;
 	}
 
 	sent_len = 0;
-	status = WIFI_SendData(g_wifi_socket,
-									   payload,
-									   (uint16_t)n,
-									   &sent_len,
-									   7000U);
+	status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, 7000U);
 
 	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
 		return 0;
 	}
-
 	return -13;
 }
 
