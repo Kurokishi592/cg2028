@@ -20,6 +20,8 @@
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_PktBasic.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Irq.h"
 
+#include "lcd.h"
+
 #include "stdio.h"
 #include "string.h"
 #include "math.h"
@@ -70,11 +72,19 @@ static void fd_update_windows(float acc_mag, float gyro_mag);
 
 static void fd_get_ranges(float *acc_range, float *gyro_range);
 
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == ISM43362_DRDY_EXTI1_Pin) {
 		SPI_WIFI_ISR();
 	}
+}
+
+void Error_Handler(void)
+{
+  /* User can add his own implementation to report the HAL error return state */
+  while(1) 
+  {
+	blink_LED2(100);
+  }
 }
 
 /* --------------------------- Globals and constants --------------------------- */
@@ -380,6 +390,7 @@ static void init (void)
 	BSP_LED_Off(LED2);											// Set the initial LED state to off
 	BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);					// Initialize user button
 	
+	// Initialize Wi-Fi module, connect to ESP32 
 	char wifi_status_buf[100];
 	
 	int status_len_1 = sprintf(wifi_status_buf, "Device initialized\r\n");
@@ -413,6 +424,10 @@ static void init (void)
 	} else {
 		g_wifi_ready = 1;
 	}
+
+	SystemClock_Config();
+
+	lcd_start();
 }
 
 static int WIFI_AppSendText(const char *text)
@@ -870,6 +885,61 @@ static void UART1_Init(void)
 		while(1);
 	}
 
+}
+
+void SystemClock_Config(void)
+{
+  /* oscillator and clocks configs */
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  
+  /* The voltage scaling allows optimizing the power consumption when the device is
+     clocked below the maximum system frequency, to update the voltage scaling value
+     regarding system frequency refer to product datasheet.  */
+
+  /* Enable Power Control clock */
+  __HAL_RCC_PWR_CLK_ENABLE();
+
+  if(HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    /* Initialization Error */
+    Error_Handler();
+  }
+
+  /* Disable Power Control clock */
+  __HAL_RCC_PWR_CLK_DISABLE();
+
+  /* 80 Mhz from PLL with MSI 8Mhz as source clock */
+  /* MSI is enabled after System reset, activate PLL with MSI as source */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_7;   /* 8 Mhz */
+  RCC_OscInitStruct.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+  RCC_OscInitStruct.PLL.PLLM = 1;
+  RCC_OscInitStruct.PLL.PLLN = 20;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLP = 7;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if(HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    /* Initialization Error */
+    Error_Handler();
+  }
+  
+  /* Select PLL as system clock source and configure the HCLK, PCLK1 and PCLK2 
+     clocks dividers */
+  RCC_ClkInitStruct.ClockType = (RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2);
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if(HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    /* Initialization Error */
+    Error_Handler();
+  }
 }
 
 /**
