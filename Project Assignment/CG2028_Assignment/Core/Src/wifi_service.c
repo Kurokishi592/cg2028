@@ -1,28 +1,36 @@
 #include "wifi_service.h"
 
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "main.h"
 #include "wifi_secrets.h"
 #include "../../Drivers/BSP/Components/es_wifi/es_wifi.h"
 
-#define WIFI_MAX_INIT_RETRY       3
+#define WIFI_MAX_INIT_RETRY       2
 #define WIFI_IO_TIMEOUT_MS        4500U
-#define WIFI_RETRY_DELAY_MS       250U
-#define WIFI_CONNECT_ATTEMPTS     3
-#define WIFI_CONNECT_SETTLE_MS    700U
-#define TELEGRAM_HOST             "api.telegram.org"
-#define TELEGRAM_PORT             443
+#define WIFI_RETRY_DELAY_MS       120U
+#define WIFI_CONNECT_ATTEMPTS     2
+#define WIFI_CONNECT_SETTLE_MS    220U
+#define WIFI_HTTP_REQ_BUFFER_SIZE 320U
+#define WIFI_SOCKET_SETTLE_MS     80U
+#define WIFI_SEND_TIMEOUT_MS      5000U
+#define WIFI_RECV_TIMEOUT_MS      2500U
 #define WIFI_RESET_PULSE_MS       10U
 #define WIFI_RESET_SETTLE_MS      500U
 #define WIFI_DRDY_STARTUP_TO_MS   2500U
-#define WIFI_STARTUP_DRAIN_MAX    64U
+#define WIFI_TCP_OPEN_SOCKET_TRIES 2U
+#define WIFI_TCP_OPEN_RETRIES     2U
+#define WIFI_TCP_RETRY_DELAY_MS   80U
+#define WIFI_DEBUG_UART           1U
 
 #define WIFI_ERR_BUS_REGISTER     -11
 #define WIFI_ERR_INIT_FAIL        -12
 #define WIFI_ERR_CONNECT_FAIL     -22
+#define WIFI_ERR_SEND_EMPTY       -41
+#define WIFI_ERR_SEND_OPEN_FAIL   -42
+#define WIFI_ERR_SEND_FAIL        -43
 
 static uint32_t WIFI_ClampTimeout(uint32_t timeout)
 {
@@ -54,10 +62,49 @@ static void WIFI_ModuleGpioInit(void);
 static void WIFI_IndicatorInit(void);
 static void WIFI_IndicatorOn(void);
 static int8_t WIFI_SPI3_Init(void);
+static int8_t WIFI_PerformHardwareReset(void);
 static int8_t WIFI_ResetModulePrompt(void);
 static int8_t WIFI_WaitReadyState(GPIO_PinState expected, uint32_t timeout_ms);
 static int8_t WIFI_WaitReadyRising(uint32_t timeout_ms);
 static void WIFI_DelayUs(uint32_t us);
+static int WIFI_FormatEsp32ProxyHttpRequest(uint8_t *request, size_t request_size, int event_code);
+static int8_t WIFI_ParseIpv4Literal(const char *host, uint8_t out_ip[4]);
+static int8_t WIFI_ResolveHostIpv4(const char *host, uint8_t out_ip[4]);
+static int8_t WIFI_OpenTcpConnection(const uint8_t ip_addr[4], uint16_t remote_port, ES_WIFI_Conn_t *out_conn, uint8_t *out_socket);
+static int8_t WIFI_TryConnectSecurity(ES_WIFI_SecurityType_t sec);
+static void WIFI_Log(const char *fmt, ...);
+
+#if WIFI_DEBUG_UART
+extern UART_HandleTypeDef huart1;
+#endif
+
+static void WIFI_Log(const char *fmt, ...)
+{
+#if WIFI_DEBUG_UART
+    char line[180];
+    va_list args;
+
+    va_start(args, fmt);
+    int written = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    if (written <= 0) {
+        return;
+    }
+
+    size_t line_len = strnlen(line, sizeof(line));
+    if ((line_len + 2U) < sizeof(line)) {
+        line[line_len] = '\r';
+        line[line_len + 1U] = '\n';
+        line[line_len + 2U] = '\0';
+        line_len += 2U;
+    }
+
+    HAL_UART_Transmit(&huart1, (uint8_t *)line, (uint16_t)line_len, 200U);
+#else
+    (void)fmt;
+#endif
+}
 
 static int8_t WIFI_RegisterBus(void)
 {
@@ -77,6 +124,15 @@ static int8_t WIFI_RegisterBus(void)
     }
 
     registered = 1;
+    return 0;
+}
+
+static int8_t WIFI_PerformHardwareReset(void)
+{
+    HAL_GPIO_WritePin(ISM43362_RST_GPIO_Port, ISM43362_RST_Pin, GPIO_PIN_RESET);
+    HAL_Delay(WIFI_RESET_PULSE_MS);
+    HAL_GPIO_WritePin(ISM43362_RST_GPIO_Port, ISM43362_RST_Pin, GPIO_PIN_SET);
+    HAL_Delay(WIFI_RESET_SETTLE_MS);
     return 0;
 }
 
@@ -229,10 +285,9 @@ static int8_t WIFI_ResetModulePrompt(void)
     HAL_GPIO_WritePin(ISM43362_WAKEUP_GPIO_Port, ISM43362_WAKEUP_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(ISM43362_SPI3_CSN_GPIO_Port, ISM43362_SPI3_CSN_Pin, GPIO_PIN_SET);
 
-    HAL_GPIO_WritePin(ISM43362_RST_GPIO_Port, ISM43362_RST_Pin, GPIO_PIN_RESET);
-    HAL_Delay(WIFI_RESET_PULSE_MS);
-    HAL_GPIO_WritePin(ISM43362_RST_GPIO_Port, ISM43362_RST_Pin, GPIO_PIN_SET);
-    HAL_Delay(WIFI_RESET_SETTLE_MS);
+    if (WIFI_PerformHardwareReset() != 0) {
+        return -1;
+    }
 
     HAL_GPIO_WritePin(ISM43362_SPI3_CSN_GPIO_Port, ISM43362_SPI3_CSN_Pin, GPIO_PIN_RESET);
     WIFI_DelayUs(15);
@@ -269,7 +324,7 @@ static int8_t WIFI_ResetModulePrompt(void)
 
 static int8_t WIFI_IO_Init(uint16_t mode)
 {
-    if (mode == ES_WIFI_INIT) {
+    if ((mode == ES_WIFI_INIT) || (mode == ES_WIFI_RESET)) {
         if (WIFI_ModulePowerUp() != 0) {
             return -1;
         }
@@ -281,13 +336,6 @@ static int8_t WIFI_IO_Init(uint16_t mode)
             }
         }
 
-        return WIFI_ResetModulePrompt();
-    }
-
-    if (mode == ES_WIFI_RESET) {
-        if (WIFI_ModulePowerUp() != 0) {
-            return -1;
-        }
         return WIFI_ResetModulePrompt();
     }
 
@@ -405,8 +453,7 @@ static int8_t WIFI_EnsureInit(void)
 
 static int8_t WIFI_EnsureConnected(void)
 {
-    static const ES_WIFI_SecurityType_t sec_try[] = {
-        ES_WIFI_SEC_WPA2,
+    static const ES_WIFI_SecurityType_t sec_fallback[] = {
         ES_WIFI_SEC_WPA_WPA2,
         ES_WIFI_SEC_WPA
     };
@@ -420,26 +467,52 @@ static int8_t WIFI_EnsureConnected(void)
         return init_status;
     }
 
+    if (ES_WIFI_IsConnected(&esWifiObj)) {
+        wifi_connected = 1;
+        return 0;
+    }
+
     for (uint8_t attempt = 0; attempt < WIFI_CONNECT_ATTEMPTS; ++attempt) {
         (void)ES_WIFI_Disconnect(&esWifiObj);
-        HAL_Delay(100);
+        HAL_Delay(80);
 
-        for (uint8_t sec_idx = 0; sec_idx < (uint8_t)(sizeof(sec_try) / sizeof(sec_try[0])); ++sec_idx) {
-            if (ES_WIFI_Connect(&esWifiObj,
-                                WIFI_SECRET_SSID,
-                                WIFI_SECRET_PASSWORD,
-                                sec_try[sec_idx]) == ES_WIFI_STATUS_OK) {
-                HAL_Delay(WIFI_CONNECT_SETTLE_MS);
-                if (ES_WIFI_IsConnected(&esWifiObj)) {
-                    wifi_connected = 1;
-                    return 0;
-                }
+        if (WIFI_TryConnectSecurity(ES_WIFI_SEC_WPA2) == 0) {
+            wifi_connected = 1;
+            return 0;
+        }
+
+        for (uint8_t sec_idx = 0; sec_idx < (uint8_t)(sizeof(sec_fallback) / sizeof(sec_fallback[0])); ++sec_idx) {
+            if (WIFI_TryConnectSecurity(sec_fallback[sec_idx]) == 0) {
+                wifi_connected = 1;
+                return 0;
             }
         }
+
         HAL_Delay(WIFI_RETRY_DELAY_MS);
     }
 
     return WIFI_ERR_CONNECT_FAIL;
+}
+
+static int8_t WIFI_TryConnectSecurity(ES_WIFI_SecurityType_t sec)
+{
+    int8_t connect_status = ES_WIFI_Connect(&esWifiObj,
+                                            WIFI_SECRET_SSID,
+                                            WIFI_SECRET_PASSWORD,
+                                            sec);
+    if (connect_status != ES_WIFI_STATUS_OK) {
+        WIFI_Log("WIFI connect fail sec=%d status=%d", (int)sec, (int)connect_status);
+        return -1;
+    }
+
+    HAL_Delay(WIFI_CONNECT_SETTLE_MS);
+    if (!ES_WIFI_IsConnected(&esWifiObj)) {
+        WIFI_Log("WIFI connect not associated sec=%d", (int)sec);
+        return -1;
+    }
+
+    WIFI_Log("WIFI connected sec=%d", (int)sec);
+    return 0;
 }
 
 int WIFI_Init(void)
@@ -447,28 +520,106 @@ int WIFI_Init(void)
     return WIFI_EnsureConnected();
 }
 
-int WIFI_SendHttpRequest(int fall_count)
+static int WIFI_FormatEsp32ProxyHttpRequest(uint8_t *request, size_t request_size, int event_code)
 {
-    uint8_t ip_addr[4] = {0};
-    uint8_t payload[300];
-    uint16_t sent_len = 0;
-    uint16_t recv_len = 0;
-    uint8_t socket = 0;
-    char message[128];
-    ES_WIFI_Conn_t conn;
+    char body[128];
+    const char *event_name = "none";
 
-    memset(&conn, 0, sizeof(conn));
-
-    if (WIFI_EnsureConnected() != 0) {
+    if ((request == NULL) || (request_size == 0U)) {
         return -1;
     }
 
-    if (ES_WIFI_DNS_LookUp(&esWifiObj, TELEGRAM_HOST, ip_addr) != ES_WIFI_STATUS_OK) {
-        return -2;
+    if (event_code == 0) {
+        event_name = "near_fall";
+    } else if (event_code == 1) {
+        event_name = "real_fall";
+    } else if (event_code == 2) {
+        event_name = "manual_alert";
     }
 
-    conn.Number = socket;
-    conn.RemotePort = TELEGRAM_PORT;
+    int body_len = snprintf(body,
+                            sizeof(body),
+                            "{\"event_code\":%d,\"event\":\"%s\"}",
+                            event_code,
+                            event_name);
+    if ((body_len <= 0) || (body_len >= (int)sizeof(body))) {
+        return -1;
+    }
+
+    int req_len = snprintf((char *)request,
+                           request_size,
+                           "POST %s HTTP/1.1\r\n"
+                           "Host: %s\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Content-Length: %d\r\n"
+                           "Connection: close\r\n\r\n"
+                           "%s",
+                           ESP32_PROXY_PATH,
+                           ESP32_PROXY_HOST,
+                           body_len,
+                           body);
+
+    if ((req_len <= 0) || (req_len >= (int)request_size)) {
+        return -1;
+    }
+
+    return req_len;
+}
+
+static int8_t WIFI_ParseIpv4Literal(const char *host, uint8_t out_ip[4])
+{
+    unsigned int a = 0;
+    unsigned int b = 0;
+    unsigned int c = 0;
+    unsigned int d = 0;
+    char tail = '\0';
+
+    if ((host == NULL) || (out_ip == NULL)) {
+        return -1;
+    }
+
+    if (sscanf(host, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) {
+        return -1;
+    }
+
+    if ((a > 255U) || (b > 255U) || (c > 255U) || (d > 255U)) {
+        return -1;
+    }
+
+    out_ip[0] = (uint8_t)a;
+    out_ip[1] = (uint8_t)b;
+    out_ip[2] = (uint8_t)c;
+    out_ip[3] = (uint8_t)d;
+    return 0;
+}
+
+static int8_t WIFI_ResolveHostIpv4(const char *host, uint8_t out_ip[4])
+{
+    if ((host == NULL) || (out_ip == NULL)) {
+        return -1;
+    }
+
+    if (WIFI_ParseIpv4Literal(host, out_ip) == 0) {
+        return 0;
+    }
+
+    if (ES_WIFI_DNS_LookUp(&esWifiObj, host, out_ip) != ES_WIFI_STATUS_OK) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int8_t WIFI_OpenTcpConnection(const uint8_t ip_addr[4], uint16_t remote_port, ES_WIFI_Conn_t *out_conn, uint8_t *out_socket)
+{
+    ES_WIFI_Conn_t conn;
+
+    if ((ip_addr == NULL) || (out_conn == NULL) || (out_socket == NULL)) {
+        return -1;
+    }
+
+    memset(&conn, 0, sizeof(conn));
+    conn.RemotePort = remote_port;
     conn.LocalPort = 0;
     conn.RemoteIP[0] = ip_addr[0];
     conn.RemoteIP[1] = ip_addr[1];
@@ -476,44 +627,101 @@ int WIFI_SendHttpRequest(int fall_count)
     conn.RemoteIP[3] = ip_addr[3];
     conn.Type = ES_WIFI_TCP_CONNECTION;
 
-    if (ES_WIFI_StartClientConnection(&esWifiObj, &conn) != ES_WIFI_STATUS_OK) {
-        conn.Type = ES_WIFI_TCP_SSL_CONNECTION;
-        if (ES_WIFI_StartClientConnection(&esWifiObj, &conn) != ES_WIFI_STATUS_OK) {
-            return -3;
+    for (uint8_t attempt = 0; attempt < WIFI_TCP_OPEN_RETRIES; ++attempt) {
+        for (uint8_t socket_try = 0; socket_try < WIFI_TCP_OPEN_SOCKET_TRIES; ++socket_try) {
+            conn.Number = socket_try;
+            (void)ES_WIFI_StopClientConnection(&esWifiObj, &conn);
+            HAL_Delay(20);
+
+            if (ES_WIFI_StartClientConnection(&esWifiObj, &conn) == ES_WIFI_STATUS_OK) {
+                *out_conn = conn;
+                *out_socket = socket_try;
+                return 0;
+            }
+        }
+
+        if ((attempt + 1U) < WIFI_TCP_OPEN_RETRIES) {
+            HAL_Delay(WIFI_TCP_RETRY_DELAY_MS);
         }
     }
 
-    snprintf(message,
-             sizeof(message),
-             "Fall detected! Count=%d (CG2028)",
+    return -1;
+}
+
+int WIFI_SendHttpRequest(int fall_count)
+{
+    uint8_t ip_addr[4] = {0};
+    static uint8_t payload[WIFI_HTTP_REQ_BUFFER_SIZE];
+    uint16_t payload_len = 0;
+    uint16_t sent_len = 0;
+    uint16_t recv_len = 0;
+    uint8_t socket = 0;
+    ES_WIFI_Conn_t conn;
+
+    memset(payload, 0, sizeof(payload));
+    memset(&conn, 0, sizeof(conn));
+
+    if (WIFI_EnsureConnected() != 0) {
+        WIFI_Log("HTTP abort: WiFi not connected");
+        return -1;
+    }
+
+    if (WIFI_ResolveHostIpv4(ESP32_PROXY_HOST, ip_addr) != 0) {
+        WIFI_Log("HTTP resolve fail host=%s", ESP32_PROXY_HOST);
+        return -2;
+    }
+
+    WIFI_Log("HTTP target %u.%u.%u.%u:%u event=%d",
+             ip_addr[0], ip_addr[1], ip_addr[2], ip_addr[3],
+             (unsigned int)ESP32_PROXY_PORT,
              fall_count);
 
-    snprintf((char *)payload,
-             sizeof(payload),
-             "GET /bot%s/sendMessage?chat_id=%s&text=%s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "Connection: close\r\n\r\n",
-             TELEGRAM_BOT_TOKEN,
-             TELEGRAM_CHAT_ID,
-             message,
-             TELEGRAM_HOST);
+    if (WIFI_OpenTcpConnection(ip_addr, ESP32_PROXY_PORT, &conn, &socket) != 0) {
+        WIFI_Log("HTTP open fail all sockets");
+        return WIFI_ERR_SEND_OPEN_FAIL;
+    }
+
+    WIFI_Log("HTTP socket open ok socket=%u", (unsigned int)socket);
+
+    HAL_Delay(WIFI_SOCKET_SETTLE_MS);
+
+    int req_len = WIFI_FormatEsp32ProxyHttpRequest(payload, sizeof(payload), fall_count);
+    if (req_len <= 0) {
+        (void)ES_WIFI_StopClientConnection(&esWifiObj, &conn);
+        WIFI_Log("HTTP request format fail");
+        return WIFI_ERR_SEND_EMPTY;
+    }
+
+    payload_len = (uint16_t)req_len;
 
     if (ES_WIFI_SendData(&esWifiObj,
                          socket,
                          payload,
-                         (uint16_t)strlen((char *)payload),
+                         payload_len,
                          &sent_len,
-                         5000) != ES_WIFI_STATUS_OK) {
-        (void)ES_WIFI_StopClientConnection(&esWifiObj, &conn);
-        return -4;
+                         WIFI_SEND_TIMEOUT_MS) != ES_WIFI_STATUS_OK) {
+        HAL_Delay(120);
+        WIFI_Log("HTTP send retry socket=%u", (unsigned int)socket);
+        if (ES_WIFI_SendData(&esWifiObj,
+                             socket,
+                             payload,
+                             payload_len,
+                             &sent_len,
+                             WIFI_SEND_TIMEOUT_MS) != ES_WIFI_STATUS_OK) {
+            (void)ES_WIFI_StopClientConnection(&esWifiObj, &conn);
+            WIFI_Log("HTTP send fail socket=%u", (unsigned int)socket);
+            return WIFI_ERR_SEND_FAIL;
+        }
     }
+
+    WIFI_Log("HTTP send ok bytes=%u", (unsigned int)sent_len);
 
     (void)ES_WIFI_ReceiveData(&esWifiObj,
                               socket,
                               payload,
                               sizeof(payload) - 1,
                               &recv_len,
-                              5000);
+                              WIFI_RECV_TIMEOUT_MS);
 
     (void)ES_WIFI_StopClientConnection(&esWifiObj, &conn);
     return 0;
