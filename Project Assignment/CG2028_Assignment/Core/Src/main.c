@@ -130,7 +130,6 @@ int main(void)
 {
 	//-------------------------------------- Initialise Device --------------------------------------//
 	init(); // initialize peripherals and UART for transmission
-	
 	while (1)
 	{
 		/* -------------------------------------- READ ACCELEROMETER VALUES AND PRE-PROCESS -------------------------------------- */
@@ -380,7 +379,11 @@ static void RF_SPI3_Init() {
 static void init (void)
 {
 	HAL_Init();													// Reset all peripherals, initialize flash interface and systick
+	SystemClock_Config();
 	UART1_Init();												// Initialize UART1 for serial communication
+	lcd_start();
+	lcd_draw_text(80, 120, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(20, 160, "Initialization...", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 
 	// Peripheral initializations using BSP functions
 	BSP_LED_Init(LED2);
@@ -400,7 +403,10 @@ static void init (void)
 
 	WIFI_Status_t wifi_status = WIFI_Init();
 
-	wifi_status &= WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
+	wifi_status = WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
+	lcd_clear(LCD_COLOR_WHITE);
+	lcd_draw_text(65, 120, "Connecting", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(50, 160, "to Wi-Fi...", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	if (wifi_status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return;
@@ -416,7 +422,7 @@ static void init (void)
 		g_wifi_server_ip[2] = (uint8_t)c;
 		g_wifi_server_ip[3] = (uint8_t)d;
 	}
-
+	
 	wifi_status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
 	if (wifi_status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
@@ -424,10 +430,36 @@ static void init (void)
 	} else {
 		g_wifi_ready = 1;
 	}
+	lcd_clear(LCD_COLOR_GREEN);
+	lcd_draw_text(65, 130, "Wi-Fi", LCD_COLOR_BLACK, LCD_COLOR_GREEN, 3);
+	lcd_draw_text(30, 170, "Connected!", LCD_COLOR_BLACK, LCD_COLOR_GREEN, 3);
+	HAL_Delay(500);
+	lcd_clear(LCD_COLOR_WHITE);
+	lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	
+	// TEMP, RMB TO DELETE
+	HAL_Delay(4000);
+	lcd_clear(LCD_COLOR_WHITE);
+	lcd_draw_text(70, 20, "Haha", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(80, 60, "You", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(70, 100, "Fell!", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
 
-	SystemClock_Config();
+	lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(30, 175, "98.76", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(135, 175, "1234.56", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 240, "12.3", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(95, 240, "45.6", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(170, 240, "78.9", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 
-	lcd_start();
+	lcd_draw_text(50, 280, "Press button", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(65, 300, "to revive", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
+
 }
 
 static int WIFI_AppSendText(const char *text)
