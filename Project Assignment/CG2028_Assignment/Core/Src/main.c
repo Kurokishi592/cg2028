@@ -388,16 +388,8 @@ static void init (void)
 	}
 
 	WIFI_Status_t wifi_status = WIFI_Init();
-	int status_len_2 = sprintf(wifi_status_buf, "WIFI init status: %d\r\n", (int)wifi_status);
-	if (status_len_2 > 0) {
-		HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len_2, HAL_MAX_DELAY);
-	}
 
 	wifi_status &= WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
-	status_len_2 = sprintf(wifi_status_buf, "WIFI connect status: %d\r\n", (int)wifi_status);
-	if (status_len_2 > 0) {
-		HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len_2, HAL_MAX_DELAY);
-	}
 	if (wifi_status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return;
@@ -415,106 +407,19 @@ static void init (void)
 	}
 
 	wifi_status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
-	status_len_2 = sprintf(wifi_status_buf, "WIFI open conn status: %d\r\n", (int)wifi_status);
-	if (status_len_2 > 0) {
-		HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len_2, HAL_MAX_DELAY);
-	}
 	if (wifi_status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return;
 	} else {
 		g_wifi_ready = 1;
 	}
-
-	int status_len = sprintf(wifi_status_buf, "WIFI app init status: %d\r\n", (int)wifi_status);
-	if (status_len > 0) {
-		HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len, HAL_MAX_DELAY);
-	}
-	if (wifi_status == 0) {
-		int probe_status = WIFI_AppSendText("hello");
-		status_len = sprintf(wifi_status_buf, "WIFI probe send status: %d\r\n", probe_status);
-		if (status_len > 0) {
-			HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len, HAL_MAX_DELAY);
-		}
-	}
-
-	// int wifi_init_status = WIFI2_Init();							// Initialize Wi-Fi module
-	// char wifi_status_buf[80];
-	// int status_len = sprintf(wifi_status_buf, "WIFI2 init status: %d\r\n", wifi_init_status);
-	// if (status_len > 0) {
-	// 	HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len, HAL_MAX_DELAY);
-	// }
-
-	// if (wifi_init_status == 0) {
-	// 	int probe_status = WIFI2_SendTcp("hello");
-	// 	status_len = sprintf(wifi_status_buf, "WIFI2 probe send status: %d\r\n", probe_status);
-	// 	if (status_len > 0) {
-	// 		HAL_UART_Transmit(&huart1, (uint8_t*)wifi_status_buf, (uint16_t)status_len, HAL_MAX_DELAY);
-	// 	}
-	// }
 }
-
-// static int WIFI_AppInit(void)
-// {
-// 	WIFI_Status_t status;
-
-// 	status = WIFI_Init();
-// 	if (status != WIFI_STATUS_OK) {
-// 		return -1;
-// 	}
-
-// 	status = WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
-// 	if (status != WIFI_STATUS_OK) {
-// 		return -2;
-// 	}
-
-// 	unsigned int a = 0;
-// 	unsigned int b = 0;
-// 	unsigned int c = 0;
-// 	unsigned int d = 0;
-// 	char tail = '\0';
-// 	if (sscanf(ESP32_PROXY_HOST, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) == 4) {
-// 		if ((a > 255U) || (b > 255U) || (c > 255U) || (d > 255U)) {
-// 			return -3;
-// 		}
-// 		g_wifi_server_ip[0] = (uint8_t)a;
-// 		g_wifi_server_ip[1] = (uint8_t)b;
-// 		g_wifi_server_ip[2] = (uint8_t)c;
-// 		g_wifi_server_ip[3] = (uint8_t)d;
-// 	} else {
-// 		status = WIFI_GetHostAddress(ESP32_PROXY_HOST, g_wifi_server_ip);
-// 		if (status != WIFI_STATUS_OK) {
-// 			return -4;
-// 		}
-// 	}
-
-// 	(void)WIFI_CloseClientConnection(g_wifi_socket);
-// 	status = WIFI_OpenClientConnection(g_wifi_socket,
-// 									  WIFI_TCP_PROTOCOL,
-// 									  "conn",
-// 									  g_wifi_server_ip,
-// 									  ESP32_PROXY_PORT,
-// 									  0);
-// 	if (status != WIFI_STATUS_OK) {
-// 		return -5;
-// 	}
-
-// 	g_wifi_ready = 1;
-// 	return 0;
-// }
 
 static int WIFI_AppSendText(const char *text)
 {
 	if (text == NULL) {
 		return -10;
 	}
-
-	// if (!g_wifi_ready) {
-	// 	int init_status = WIFI_AppInit();
-	// 	if (init_status != 0) {
-	// 		return init_status;
-	// 	}
-	// }
 
 	uint8_t payload[128];
 	int n = snprintf((char *)payload, sizeof(payload), "%s\n", text);
