@@ -22,6 +22,8 @@
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_PktBasic.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Irq.h"
 
+#include "lcd.h"
+
 #include "stdio.h"
 #include "string.h"
 #include "math.h"
@@ -48,8 +50,8 @@ extern int mov_avg(int N, int* accel_buff); // asm implementation
 int mov_avg_C(int N, int* accel_buff); // Reference C implementation
 int fall_get_state(void);
 void SPI_WIFI_ISR(void);
+void SystemClock_Config(void);
 
-static SPI_HandleTypeDef hspi3;
 
 typedef enum
 {
@@ -84,11 +86,19 @@ static void fd_update_windows(float acc_mag, float gyro_mag);
 
 static void fd_get_ranges(float *acc_range, float *gyro_range);
 
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == ISM43362_DRDY_EXTI1_Pin) {
 		SPI_WIFI_ISR();
 	}
+}
+
+void Error_Handler(void)
+{
+  /* User can add his own implementation to report the HAL error return state */
+  while(1) 
+  {
+	blink_LED2(100);
+  }
 }
 
 /* --------------------------- Globals and constants --------------------------- */
@@ -364,7 +374,11 @@ static void RF_SPI3_Init() {
 static void init (void)
 {
 	HAL_Init();													// Reset all peripherals, initialize flash interface and systick
+	SystemClock_Config();
 	UART1_Init();												// Initialize UART1 for serial communication
+	lcd_start();
+	lcd_draw_text(80, 120, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(20, 160, "Initialization...", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 
 	// Peripheral initializations using BSP functions
 	BSP_LED_Init(LED2);
@@ -376,6 +390,7 @@ static void init (void)
 	BSP_LED_Off(LED2);											// Set the initial LED state to off
 	BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);					// Initialize user button
 	
+	// Initialize Wi-Fi module, connect to ESP32 
 	char wifi_status_buf[100];
 	
 	int status_len_1 = sprintf(wifi_status_buf, "Device initialized\r\n");
@@ -385,7 +400,10 @@ static void init (void)
 
 	WIFI_Status_t wifi_status = WIFI_Init();
 
-	wifi_status &= WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
+	wifi_status = WIFI_Connect(WIFI_SSID, WIFI_PASSWORD, WIFI_ECN_WPA2_PSK);
+	lcd_clear(LCD_COLOR_WHITE);
+	lcd_draw_text(65, 120, "Connecting", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(50, 160, "to Wi-Fi...", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	if (wifi_status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return;
@@ -401,7 +419,7 @@ static void init (void)
 		g_wifi_server_ip[2] = (uint8_t)c;
 		g_wifi_server_ip[3] = (uint8_t)d;
 	}
-
+	
 	wifi_status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
 	if (wifi_status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
@@ -409,6 +427,36 @@ static void init (void)
 	} else {
 		g_wifi_ready = 1;
 	}
+	lcd_clear(LCD_COLOR_GREEN);
+	lcd_draw_text(65, 130, "Wi-Fi", LCD_COLOR_BLACK, LCD_COLOR_GREEN, 3);
+	lcd_draw_text(30, 170, "Connected!", LCD_COLOR_BLACK, LCD_COLOR_GREEN, 3);
+	HAL_Delay(500);
+	lcd_clear(LCD_COLOR_WHITE);
+	lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	
+	// TEMP, RMB TO DELETE
+	HAL_Delay(4000);
+	lcd_clear(LCD_COLOR_WHITE);
+	lcd_draw_text(70, 20, "Haha", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(80, 60, "You", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+	lcd_draw_text(70, 100, "Fell!", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+
+	lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(30, 175, "98.76", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(135, 175, "1234.56", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 240, "12.3", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(95, 240, "45.6", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(170, 240, "78.9", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+
+	lcd_draw_text(50, 280, "Press button", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(65, 300, "to revive", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
+
 }
 
 static int WIFI_AppSendText(const char *text)
@@ -424,39 +472,25 @@ static int WIFI_AppSendText(const char *text)
 	}
 
 	uint16_t sent_len = 0;
-	WIFI_Status_t status = WIFI_SendData(g_wifi_socket,
-									   payload,
-									   (uint16_t)n,
-									   &sent_len,
-									   7000U);
+	WIFI_Status_t status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, 7000U);
 
 	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
 		return 0;
 	}
 
 	(void)WIFI_CloseClientConnection(g_wifi_socket);
-	status = WIFI_OpenClientConnection(g_wifi_socket,
-									  WIFI_TCP_PROTOCOL,
-									  "conn",
-									  g_wifi_server_ip,
-									  ESP32_PROXY_PORT,
-									  0);
+	status = WIFI_OpenClientConnection(g_wifi_socket, WIFI_TCP_PROTOCOL, "conn", g_wifi_server_ip, ESP32_PROXY_PORT, 0);
 	if (status != WIFI_STATUS_OK) {
 		g_wifi_ready = 0;
 		return -12;
 	}
 
 	sent_len = 0;
-	status = WIFI_SendData(g_wifi_socket,
-									   payload,
-									   (uint16_t)n,
-									   &sent_len,
-									   7000U);
+	status = WIFI_SendData(g_wifi_socket, payload, (uint16_t)n, &sent_len, 7000U);
 
 	if ((status == WIFI_STATUS_OK) && (sent_len == (uint16_t)n)) {
 		return 0;
 	}
-
 	return -13;
 }
 
@@ -961,6 +995,71 @@ static void UART1_Init(void)
 		while(1);
 	}
 
+}
+
+void SystemClock_Config(void)
+{
+  /* oscillator and clocks configs */
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  
+  /* The voltage scaling allows optimizing the power consumption when the device is
+     clocked below the maximum system frequency, to update the voltage scaling value
+     regarding system frequency refer to product datasheet.  */
+
+  /* Enable Power Control clock */
+  __HAL_RCC_PWR_CLK_ENABLE();
+
+  if(HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    /* Initialization Error */
+    Error_Handler();
+  }
+
+  /* Disable Power Control clock */
+  __HAL_RCC_PWR_CLK_DISABLE();
+
+  /* 80 Mhz from PLL with MSI 8Mhz as source clock */
+  /* MSI is enabled after System reset, activate PLL with MSI as source */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_7;   /* 8 Mhz */
+  RCC_OscInitStruct.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+  RCC_OscInitStruct.PLL.PLLM = 1;
+  RCC_OscInitStruct.PLL.PLLN = 20;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  RCC_OscInitStruct.PLL.PLLP = 7;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if(HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    /* Initialization Error */
+    Error_Handler();
+  }
+  
+  /* Select PLL as system clock source and configure the HCLK, PCLK1 and PCLK2 
+     clocks dividers */
+  RCC_ClkInitStruct.ClockType = (RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2);
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if(HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    /* Initialization Error */
+    Error_Handler();
+  }
+}
+
+/**
+ * Helper function for LED blinking
+ * @param delay_ms: Delay in milliseconds between toggles
+ */
+void blink_LED2(int delay_ms)
+{
+	BSP_LED_Toggle(LED2);
+	HAL_Delay(delay_ms);
 }
 
 
