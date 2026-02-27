@@ -15,6 +15,9 @@
 #define ILI9341_MADCTL  0x36U
 #define ILI9341_COLMOD  0x3AU
 #define LCD_FILL_BURST_PIXELS 256U
+#define LCD_TEXT_GLYPH_W 6U
+#define LCD_TEXT_GLYPH_H 7U
+#define LCD_TEXT_MAX_SCALE 4U
 
 static SPI_HandleTypeDef s_lcd_spi;
 static uint8_t s_lcd_initialized = 0U;
@@ -213,9 +216,13 @@ static void lcd_fill_screen(uint16_t color)
 
 static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
-    uint32_t total;
-    uint32_t i;
-    uint8_t pair[2];
+    static uint8_t burst[LCD_FILL_BURST_PIXELS * 2U];
+    uint32_t remaining;
+    uint16_t burst_pixels;
+    uint16_t burst_bytes;
+    uint16_t index;
+    uint8_t hi;
+    uint8_t lo;
 
     if ((w == 0U) || (h == 0U) || (x >= LCD_WIDTH) || (y >= LCD_HEIGHT)) {
         return;
@@ -230,19 +237,27 @@ static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16
 
     lcd_set_window(x, y, (uint16_t)(x + w - 1U), (uint16_t)(y + h - 1U));
 
-    pair[0] = (uint8_t)(color >> 8);
-    pair[1] = (uint8_t)(color & 0xFFU);
-    total = (uint32_t)w * (uint32_t)h;
+    hi = (uint8_t)(color >> 8);
+    lo = (uint8_t)(color & 0xFFU);
+    for (index = 0U; index < (uint16_t)(LCD_FILL_BURST_PIXELS * 2U); index += 2U) {
+        burst[index] = hi;
+        burst[index + 1U] = lo;
+    }
+
+    remaining = (uint32_t)w * (uint32_t)h;
 
     lcd_select();
     lcd_data_mode();
-    for (i = 0U; i < total; ++i) {
-        (void)HAL_SPI_Transmit(&s_lcd_spi, pair, 2U, HAL_MAX_DELAY);
+    while (remaining > 0U) {
+        burst_pixels = (remaining > LCD_FILL_BURST_PIXELS) ? LCD_FILL_BURST_PIXELS : (uint16_t)remaining;
+        burst_bytes = (uint16_t)(burst_pixels * 2U);
+        (void)HAL_SPI_Transmit(&s_lcd_spi, burst, burst_bytes, HAL_MAX_DELAY);
+        remaining -= burst_pixels;
     }
     lcd_deselect();
 }
 
-static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale)
+static void lcd_draw_char_slow(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale)
 {
     uint8_t col;
     uint8_t row;
@@ -264,6 +279,59 @@ static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t 
     }
 
     lcd_fill_rect((uint16_t)(x + 5U * scale), y, scale, (uint16_t)(7U * scale), bg);
+}
+
+static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t fg, uint16_t bg, uint8_t scale)
+{
+    static uint8_t glyph_buf[LCD_TEXT_GLYPH_W * LCD_TEXT_GLYPH_H * LCD_TEXT_MAX_SCALE * LCD_TEXT_MAX_SCALE * 2U];
+    uint16_t char_w;
+    uint16_t char_h;
+    uint16_t row;
+    uint16_t col;
+    uint32_t write_idx = 0U;
+
+    if (scale == 0U) {
+        scale = 1U;
+    }
+
+    if (scale > LCD_TEXT_MAX_SCALE) {
+        lcd_draw_char_slow(x, y, c, fg, bg, scale);
+        return;
+    }
+
+    char_w = (uint16_t)(LCD_TEXT_GLYPH_W * scale);
+    char_h = (uint16_t)(LCD_TEXT_GLYPH_H * scale);
+
+    if ((x >= LCD_WIDTH) || (y >= LCD_HEIGHT)) {
+        return;
+    }
+
+    if (((uint16_t)(x + char_w) > LCD_WIDTH) || ((uint16_t)(y + char_h) > LCD_HEIGHT)) {
+        lcd_draw_char_slow(x, y, c, fg, bg, scale);
+        return;
+    }
+
+    for (row = 0U; row < char_h; ++row) {
+        uint8_t src_row = (uint8_t)(row / scale);
+        for (col = 0U; col < char_w; ++col) {
+            uint16_t color;
+            uint8_t src_col = (uint8_t)(col / scale);
+            if (src_col >= 5U) {
+                color = bg;
+            } else {
+                uint8_t bits = lcd_glyph_col((uint8_t)c, src_col);
+                color = (((bits >> src_row) & 0x01U) != 0U) ? fg : bg;
+            }
+            glyph_buf[write_idx++] = (uint8_t)(color >> 8);
+            glyph_buf[write_idx++] = (uint8_t)(color & 0xFFU);
+        }
+    }
+
+    lcd_set_window(x, y, (uint16_t)(x + char_w - 1U), (uint16_t)(y + char_h - 1U));
+    lcd_select();
+    lcd_data_mode();
+    (void)HAL_SPI_Transmit(&s_lcd_spi, glyph_buf, (uint16_t)(char_w * char_h * 2U), HAL_MAX_DELAY);
+    lcd_deselect();
 }
 
 static void lcd_hw_init(void)
