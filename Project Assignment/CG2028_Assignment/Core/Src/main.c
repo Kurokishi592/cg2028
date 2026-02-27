@@ -239,13 +239,13 @@ int main(void)
 		if ((now - last_telebot_tick) >= TELEBOT_TASK_PERIOD_MS)
 		{
 			last_telebot_tick = now;
-			telebot_task(now, g_current_event);
+			telebot_task(now, g_latched_event);
 		}
 
 		if ((now - last_oled_tick) >= OLED_TASK_PERIOD_MS)
 		{
 			last_oled_tick = now;
-			oled_task(now, sensor_readings, g_current_event);
+			oled_task(now, sensor_readings, g_latched_event);
 		}
 	}
 }
@@ -609,6 +609,9 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	char roll_str[12];
 	char pitch_str[12];
 	char yaw_str[12];
+	static bool updateState = false;
+	static fall_event_t prevEvent = FALL_EVENT_NONE;
+
 	snprintf(acc_str, sizeof(acc_str), "%05.2f", sensor_readings.accel_magnitude_asm);
 	snprintf(gyro_str, sizeof(gyro_str), "%05.2f", sensor_readings.gyro_magnitude_asm);
 	snprintf(roll_str, sizeof(roll_str), "%.1f", sensor_readings.roll_pitch_yaw[0]);
@@ -622,13 +625,41 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	lcd_draw_text(135, 175, gyro_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
 	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(25, 240, roll_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(20, 240, roll_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
 	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(95, 240, pitch_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
 	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(165, 240, yaw_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+
+	if (event == FALL_EVENT_NEAR_FALL && updateState)
+	{
+
+	}
+	else if (event == FALL_EVENT_REAL_FALL && updateState)
+	{
+		lcd_clear(LCD_COLOR_WHITE);
+		lcd_draw_text(70, 20, "Haha", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+		lcd_draw_text(80, 60, "You", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+		lcd_draw_text(70, 100, "Fell!", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+		lcd_draw_text(50, 280, "Press button", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
+		lcd_draw_text(65, 300, "to revive", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);		
+		updateState = false;
+	}
+	else if (updateState) {
+		lcd_clear(LCD_COLOR_WHITE);
+		lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+		lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
+		lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);		
+		updateState = false;
+	}
+
+	if (event != prevEvent)
+	{
+		updateState = true;
+		prevEvent = event;
+	}
 }
 
 /**
