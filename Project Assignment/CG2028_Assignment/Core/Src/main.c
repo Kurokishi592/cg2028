@@ -6,6 +6,12 @@
 
 /* ---------------------------------------------------------------------------------------------------------- */
 /* ------------------------------------------- Includes ----------------------------------------------------- */
+
+/*
+ * This file contains the main loop for sensor reading and preprocessing, fall detection, alerts and escalation, and communications
+*/
+
+// Standard library headers
 #include "main.h"
 #include "stdio.h"
 #include "string.h"
@@ -13,6 +19,7 @@
 #include <sys/stat.h>
 #include <stdbool.h>
 
+// Drivers and BSP headers for peripherals
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
@@ -23,13 +30,13 @@
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_PktBasic.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Irq.h"
 
+// Private headers
 // #include "wifi_service2.h"
 #include "wifi.h"
 #include "wifi_secrets.h"
-
 #include "lcd.h"
-
 #include "tones.h"
+#include "fall_detection.h"
 
 #ifdef DEBUG
 #define FALL_DEBUG 0
@@ -49,37 +56,15 @@ static int WIFI_AppSendText(const char *text);
 extern void initialise_monitor_handles(void);	// for semi-hosting support (printf). Will not be required if transmitting via UART
 extern int mov_avg(int N, int* accel_buff); // asm implementation
 int mov_avg_C(int N, int* accel_buff); // Reference C implementation
-int fall_get_state(void);
 void SPI_WIFI_ISR(void);
 void SystemClock_Config(void);
 
 
-typedef enum
-{
-	FALL_EVENT_NONE = 0,
-	FALL_EVENT_NEAR_FALL = 1,
-	FALL_EVENT_REAL_FALL = 2
-} fall_event_t;
-
-static void init(void);
-static void UART1_Init(void);
 static void Buzzer_Init(void);
 static void Buzzer_On(void);
 static void Buzzer_Off(void);
 static void update_alert_outputs(fall_event_t new_event);
-extern void initialise_monitor_handles(void);	// for semi-hosting support (printf). Will not be required if transmitting via UART
-extern int mov_avg(int N, int* accel_buff); // asm implementation
-int mov_avg_C(int N, int* accel_buff); // Reference C implementation
-int fall_get_state(void); // for debugging, returns current phase of the fall detection state machine
 
-
-// Internal fall-detection state machine phases (for debugging/inspection)
-typedef enum { PHASE_UPRIGHT = 0, PHASE_FALLING, PHASE_POSTFALL } fall_phase_t;
-
-static fall_phase_t g_fall_phase = PHASE_UPRIGHT;
-
-fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3]);
-fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw, float dp_hpa);
 
 UART_HandleTypeDef huart1;
 
@@ -304,7 +289,7 @@ int main(void)
 				roll_pitch_yaw[2],
 				pressure_hpa,
 				dp_hpa,
-				fall_get_state(),
+				get_fall_state(),
 				(int)fall_event);
 		HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		#endif
@@ -318,6 +303,7 @@ static void init (void)
 	HAL_Init();													// Reset all peripherals, initialize flash interface and systick
 	SystemClock_Config();
 	UART1_Init();												// Initialize UART1 for serial communication
+	fall_detection_init();										// Initialize fall detection state machine
 	lcd_start();
 	lcd_draw_text(80, 120, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(20, 160, "Initialization...", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
@@ -447,10 +433,7 @@ static int WIFI_AppSendText(const char *text)
 	return -13;
 }
 
-int fall_get_state(void)
-{
-	return (int)g_fall_phase;
-}
+
 
 static void Buzzer_Init(void)
 {
@@ -550,168 +533,7 @@ static void update_alert_outputs(fall_event_t new_event)
 	}
 }
 
-fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw, float dp_hpa)
-{
-	/* Parameters to be tuned */
-	// const float G_NOMINAL          = G;
-	const float UPRIGHT_PITCH_MIN  = 60.0f;   // |pitch| above this -> upright-ish
-	const float LYING_PITCH_MAX    = 45.0f;   // |pitch| below this -> lying-ish
-	// const float MOVE_GYRO_TH       = 150.0f;  // basic "moving" threshold
-	const float BIG_GYRO_TH        = 2000.0f; // strong rotation -> potential fall
-	const float FREEFALL_LOW_TH    = 6.0f;    // accel magnitude much lower than 1g
-	const float ACC_DELTA_FALL_TH  = 3.0f;    // big change between samples
-	const int   FALLING_MAX_TICKS  = 5;       // max samples to stay in FALLING to avoid slow tilt as real fall
-	const int   LYING_DOWN_TICKS_MIN = 4;     // required lying+still samples (shorter to catch real falls)
-	const int   POSTFALL_MAX_TICKS = 10;      // max samples to stay in POSTFALL
 
-	// These are to identify the orientation and movements of the board.
-	float pitch_deg = roll_pitch_yaw[1];
-	bool upright_now = (fabsf(pitch_deg) > UPRIGHT_PITCH_MIN);
-	bool lying_now   = (fabsf(pitch_deg) < LYING_PITCH_MAX);
-	// bool moving_now  = (gyro_magnitude > MOVE_GYRO_TH);
-	bool big_gyro_now = (gyro_magnitude > BIG_GYRO_TH);
-	bool going_up = (dp_hpa < -0.2f); // negative pressure delta suggests upward motion
-
-	// To differentiate between normal activity, use strong change:
-	static float prev_acc_mag = 9.8f;
-	static float prev_pitch_deg = 0.0f;
-	float acc_delta   = fabsf(acc_magnitude - prev_acc_mag);
-	float pitch_delta = fabsf(pitch_deg - prev_pitch_deg);
-	bool freefall_like = (acc_magnitude < FREEFALL_LOW_TH);
-	bool strong_change = big_gyro_now || freefall_like || (acc_delta > ACC_DELTA_FALL_TH) || (pitch_delta > 15.0f);
-	static bool trigger_by_gyro = 0;
-	static bool trigger_by_accel = 0;
-
-	// To keep track of how long we've been in each phase, use counters that reset on phase change
-	static int phase_ticks = 0;
-	static int lying_down_ticks = 0;
-
-	fall_event_t result = FALL_EVENT_NONE;
-
-	// Use state machine to differentiate between near fall and real fall
-	switch (g_fall_phase)
-	{
-	case PHASE_UPRIGHT:
-		// Normal upright/sitting: small motion allowed, no impact
-		// Start falling phase only from upright posture
-		if (upright_now)
-		{
-			phase_ticks++; // we are only interested in how long we are upright
-			if (strong_change && phase_ticks > 2 && !going_up)
-			{
-				trigger_by_gyro = big_gyro_now;
-				trigger_by_accel = freefall_like || (acc_delta > ACC_DELTA_FALL_TH);
-				g_fall_phase = PHASE_FALLING;
-				phase_ticks = 0;
-			}
-
-		}
-		break;
-
-	case PHASE_FALLING:
-		phase_ticks++;
-		// Capture accel and gyro activity during fall window, as both are conditions for real fall but occurs over an episode, not a single sample
-		if(gyro_magnitude > BIG_GYRO_TH) {
-			trigger_by_gyro = true;
-		}
-		if(freefall_like || (acc_delta > ACC_DELTA_FALL_TH)) {
-			trigger_by_accel = true;
-		}
-
-		// Transition to post-fall when we reach lying orientation and it was due to a huge rotation
-		if (lying_now && trigger_by_accel)
-		{
-			g_fall_phase = PHASE_POSTFALL;
-			phase_ticks = 0;
-			lying_down_ticks = 1;
-			break;
-		}
-		// Recovered without lying -> near-fall
-		// If falling phase lasts too long without lying, treat as none and reset
-		if (phase_ticks >= FALLING_MAX_TICKS)
-		{
-			g_fall_phase = PHASE_UPRIGHT;
-			result = FALL_EVENT_NEAR_FALL;
-			phase_ticks = 0;
-			trigger_by_gyro = false;
-			trigger_by_accel = false;
-		}
-		break;
-
-	case PHASE_POSTFALL:
-		phase_ticks++;
-		if (lying_now)
-		{
-			lying_down_ticks++;
-			if (lying_down_ticks >= LYING_DOWN_TICKS_MIN)
-			{
-				// Sequence: upright -> falling -> lying still for a while => real fall
-				// g_fall_phase = PHASE_UPRIGHT; // will not re-trigger until back upright
-				if (trigger_by_accel && trigger_by_gyro) 
-				{ 
-					result = FALL_EVENT_REAL_FALL;
-				}
-				else
-				{
-					result = FALL_EVENT_NEAR_FALL;
-				}
-				
-				phase_ticks = 0;
-				trigger_by_gyro = false;
-				trigger_by_accel = false;
-
-				// Button press to manually reset state after a real fall
-				bool reset = false;
-				int button_press_ticks = 0, button_reset_ticks_required = 2, button_reset_armed = false;
-				while (!reset) {
-					if (BSP_PB_GetState(BUTTON_USER) == GPIO_PIN_SET) {
-						if(button_press_ticks < button_reset_ticks_required) {
-							button_press_ticks++;
-						}
-						if(button_reset_armed && button_press_ticks >= button_reset_ticks_required) {
-							g_fall_phase = PHASE_UPRIGHT;
-							reset = true;
-							button_reset_armed = false;
-						}
-					} else {
-						button_press_ticks = 0;
-						button_reset_armed = true;
-					}
-				}
-				break;
-			}
-		}
-		else
-		{
-			// If we move out of lying quickly (stand up or roll), classify as near-fall
-			if (phase_ticks > 2 || upright_now)
-			{
-				g_fall_phase = PHASE_UPRIGHT;
-				result = FALL_EVENT_NEAR_FALL;
-				phase_ticks = 0;
-				break;
-			}
-		}
-		// If we stay too long in ambiguous post-fall without settling, reset
-		if (phase_ticks >= POSTFALL_MAX_TICKS)
-		{
-			g_fall_phase = PHASE_UPRIGHT;
-			result = FALL_EVENT_NEAR_FALL;
-			phase_ticks = 0;
-		}
-		break;
-
-	default:
-		g_fall_phase = PHASE_UPRIGHT;
-		break;
-	}
-
-	// Update previous-sample features
-	prev_acc_mag = acc_magnitude;
-	prev_pitch_deg = pitch_deg;
-
-	return result;
-}
 
 // Window used to determine instability based on recent accel/gyro magnitudes. Updated every iteration and used to derive recent range for fall detection. Uses a simple circular buffer approach.
 static void fd_update_windows(float acc_mag, float gyro_mag)
@@ -750,178 +572,6 @@ static void fd_get_ranges(float *acc_range, float *gyro_range)
 
 	*acc_range = acc_max - acc_min;
 	*gyro_range = gyro_max - gyro_min;
-}
-
-
-/**
- * @brief  Minimal fall classifier using filtered acceleration and gyro vectors.
- *         Reads directly from accel_filt_asm and gyro_velocity.
- * @param  accel_filt_asm: Filtered acceleration vector in m/s^2
- * @param  gyro_velocity: Gyro vector (scaled output)
- * @return FALL_EVENT_NONE, FALL_EVENT_NEAR_FALL, or FALL_EVENT_REAL_FALL
- */
-fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3])
-{
-	const float G_NOMINAL = 9.8f;
-	const float STILL_ACCEL_BAND = 1.2f;
-	const float REST_ACCEL_BAND = 0.35f;
-	const float REST_GYRO_TH = 2.2f;
-	const float NEAR_GYRO_TH = 5.5f;
-	const float REAL_GYRO_TH = 8.0f;
-	const float IMPACT_ACCEL_TH = 14.0f;
-	const float FREE_FALL_ACCEL_TH = 4.5f;
-	const float JERK_IMPACT_TH = 5.0f;
-	const float NEAR_JERK_TH = 0.8f;
-
-	typedef enum
-	{
-		DETECT_IDLE = 0,
-		DETECT_WAIT_IMPACT
-	} detect_state_t;
-
-	static detect_state_t state = DETECT_IDLE;
-	static int state_ticks = 0;
-	static int near_fall_score = 0;
-	static int cooldown_ticks = 0;
-
-	static float gyro_bias_x = 0.0f;
-	static float gyro_bias_y = 0.0f;
-	static float gyro_bias_z = 0.0f;
-	static int bias_ready = 0;
-	static int bias_samples = 0;
-
-	static float prev_accel_mag = 9.8f;
-	static float gyro_mag_lpf = 0.0f;
-	static int moving_ticks = 0;
-
-	float ax = accel_filt_asm[0];
-	float ay = accel_filt_asm[1];
-	float az = accel_filt_asm[2];
-
-	float gx_raw = gyro_velocity[0];
-	float gy_raw = gyro_velocity[1];
-	float gz_raw = gyro_velocity[2];
-
-	float accel_mag = sqrtf(ax*ax + ay*ay + az*az);
-	float accel_jerk = fabsf(accel_mag - prev_accel_mag);
-	prev_accel_mag = accel_mag;
-
-	if(!bias_ready)
-	{
-		gyro_bias_x = (gyro_bias_x * bias_samples + gx_raw) / (bias_samples + 1);
-		gyro_bias_y = (gyro_bias_y * bias_samples + gy_raw) / (bias_samples + 1);
-		gyro_bias_z = (gyro_bias_z * bias_samples + gz_raw) / (bias_samples + 1);
-		bias_samples++;
-		if(bias_samples >= 20)
-		{
-			bias_ready = 1;
-		}
-		return FALL_EVENT_NONE;
-	}
-
-	if(fabsf(accel_mag - G_NOMINAL) < STILL_ACCEL_BAND)
-	{
-		const float alpha = 0.01f;
-		gyro_bias_x = (1.0f - alpha) * gyro_bias_x + alpha * gx_raw;
-		gyro_bias_y = (1.0f - alpha) * gyro_bias_y + alpha * gy_raw;
-		gyro_bias_z = (1.0f - alpha) * gyro_bias_z + alpha * gz_raw;
-	}
-
-	float gx = gx_raw - gyro_bias_x;
-	float gy = gy_raw - gyro_bias_y;
-	float gz = gz_raw - gyro_bias_z;
-	float gyro_mag = sqrtf(gx*gx + gy*gy + gz*gz);
-	gyro_mag_lpf = 0.8f * gyro_mag_lpf + 0.2f * gyro_mag;
-
-	if(cooldown_ticks > 0)
-	{
-		cooldown_ticks--;
-		return FALL_EVENT_NONE;
-	}
-
-	switch(state)
-	{
-		case DETECT_IDLE:
-			state_ticks = 0;
-
-			if((fabsf(accel_mag - G_NOMINAL) < REST_ACCEL_BAND) && (gyro_mag_lpf < REST_GYRO_TH))
-			{
-				near_fall_score = 0;
-				moving_ticks = 0;
-				return FALL_EVENT_NONE;
-			}
-
-			if(moving_ticks < 20)
-			{
-				moving_ticks++;
-			}
-
-			if(((accel_mag < FREE_FALL_ACCEL_TH) && (gyro_mag_lpf > NEAR_GYRO_TH)) ||
-			   ((accel_mag > IMPACT_ACCEL_TH) && (gyro_mag_lpf > REAL_GYRO_TH)) ||
-			   ((accel_jerk > JERK_IMPACT_TH) && (gyro_mag_lpf > REAL_GYRO_TH)))
-			{
-				state = DETECT_WAIT_IMPACT;
-				state_ticks = 0;
-				near_fall_score = 0;
-				return FALL_EVENT_NONE;
-			}
-
-			if((moving_ticks >= 3) &&
-			   (gyro_mag_lpf > NEAR_GYRO_TH) && (gyro_mag_lpf < REAL_GYRO_TH) &&
-			   (accel_mag > (G_NOMINAL - 2.5f)) && (accel_mag < IMPACT_ACCEL_TH) &&
-			   (accel_jerk > NEAR_JERK_TH))
-			{
-				if(near_fall_score < 8)
-				{
-					near_fall_score++;
-				}
-			}
-			else if(near_fall_score > 1)
-			{
-				near_fall_score -= 2;
-			}
-			else
-			{
-				near_fall_score = 0;
-			}
-
-			if(near_fall_score >= 8)
-			{
-				near_fall_score = 0;
-				cooldown_ticks = 20;
-				return FALL_EVENT_NEAR_FALL;
-			}
-
-			return FALL_EVENT_NONE;
-
-		case DETECT_WAIT_IMPACT:
-			state_ticks++;
-
-			if(((accel_mag > IMPACT_ACCEL_TH) && (gyro_mag_lpf > REAL_GYRO_TH)) ||
-			   ((accel_jerk > JERK_IMPACT_TH) && (gyro_mag_lpf > REAL_GYRO_TH)))
-			{
-				state = DETECT_IDLE;
-				state_ticks = 0;
-				cooldown_ticks = 30;
-				return FALL_EVENT_REAL_FALL;
-			}
-
-			if(state_ticks > 10)
-			{
-				state = DETECT_IDLE;
-				cooldown_ticks = 20;
-				return FALL_EVENT_NEAR_FALL;
-			}
-
-			return FALL_EVENT_NONE;
-
-		default:
-			state = DETECT_IDLE;
-			state_ticks = 0;
-			near_fall_score = 0;
-			cooldown_ticks = 0;
-			return FALL_EVENT_NONE;
-	}
 }
 
 /**
