@@ -90,29 +90,54 @@ void get_IMU_reading(int i, sensors_t *sensors)
     sensors->roll_pitch_yaw[1] = pitch_rad * 180.0f / (float)M_PI;
     
     /* -------------------------------------- COMPUTE YAW WITH COUPLING EFFECT MITIGATION -------------------------------------- */
-    float original_magX = mag_xyz[0];
-    float original_magY = mag_xyz[1];
-    // float original_magZ = mag_xyz[2];
+    // float original_magX = mag_xyz[0];
+    // float original_magY = mag_xyz[1];
+    // // float original_magZ = mag_xyz[2];
     
-    // compensate for roll
-    float polar_r_xz = sqrt(mag_xyz[0]*mag_xyz[0] + mag_xyz[2]*mag_xyz[2]);
-    // float theta_xz_init = atan2(mag_xyz[0],mag_xyz[2]);
-    // float polar_angle_after_roll = theta_xz_init - roll_rad;
-    mag_xyz[0] = polar_r_xz * cos(roll_rad);
-    mag_xyz[2] = polar_r_xz * sin(roll_rad);
+    // // compensate for roll
+    // float polar_r_xz = sqrt(mag_xyz[0]*mag_xyz[0] + mag_xyz[2]*mag_xyz[2]);
+    // // float theta_xz_init = atan2(mag_xyz[0],mag_xyz[2]);
+    // // float polar_angle_after_roll = theta_xz_init - roll_rad;
+    // mag_xyz[0] = polar_r_xz * cos(roll_rad);
+    // mag_xyz[2] = polar_r_xz * sin(roll_rad);
     
-    // compensate for pitch
-    float polar_r_yz = sqrt(mag_xyz[1]*mag_xyz[1] + mag_xyz[2]*mag_xyz[2]);
-    // float theta_yz_init = atan2(mag_xyz[1],mag_xyz[2]);
-    // float polar_angle_after_pitch = theta_yz_init - pitch_rad;
-    mag_xyz[1] = polar_r_yz * cos(pitch_rad);
-    mag_xyz[2] = polar_r_yz * sin(pitch_rad);
+    // // compensate for pitch
+    // float polar_r_yz = sqrt(mag_xyz[1]*mag_xyz[1] + mag_xyz[2]*mag_xyz[2]);
+    // // float theta_yz_init = atan2(mag_xyz[1],mag_xyz[2]);
+    // // float polar_angle_after_pitch = theta_yz_init - pitch_rad;
+    // mag_xyz[1] = polar_r_yz * cos(pitch_rad);
+    // mag_xyz[2] = polar_r_yz * sin(pitch_rad);
     
-    float deltaX = mag_xyz[0] - original_magX;
-    float deltaY = mag_xyz[1] - original_magY;
+    // float deltaX = mag_xyz[0] - original_magX;
+    // float deltaY = mag_xyz[1] - original_magY;
     
-    float yaw = atan2(mag_xyz[0] - deltaX, mag_xyz[1] - deltaY);
-    sensors->roll_pitch_yaw[2] = yaw  * 180.0f/M_PI;
+    // float yaw = atan2(mag_xyz[0] - deltaX, mag_xyz[1] - deltaY);
+    // sensors->roll_pitch_yaw[2] = yaw  * 180.0f/M_PI;
+
+    // float roll = roll_rad  * 180.0f / (float)M_PI;
+    // float pitch = pitch_rad * 180.0f / (float)M_PI;
+
+    // float cosPhi = cos(roll);
+    // float sinPhi = sin(roll);
+    // float cosTheta = cos(pitch);
+    // float sinTheta = sin(pitch);
+
+    // float mX_rot = mag_xyz[0] * cosTheta + mag_xyz[2] * sinTheta;
+    // float mY_rot = mag_xyz[0] * sinPhi * sinTheta + mag_xyz[1] * cosPhi - mag_xyz[2] * sinPhi * cosTheta;
+
+    // float yaw = atan2(mY_rot, mX_rot) * 180.0f / M_PI;
+    // sensors->roll_pitch_yaw[2] = yaw;
+
+    float mx = mag_xyz[0];
+    float my = mag_xyz[1];
+    float mz = mag_xyz[2];
+
+    float yaw = atan2(
+        my * cos(roll_rad) - mz * sin(roll_rad),
+        mx * cos(pitch_rad) + my * sin(roll_rad) * sin(pitch_rad) + mz * cos(roll_rad) * sin(pitch_rad)
+    );
+
+    sensors->roll_pitch_yaw[2] = yaw * 180.0f / M_PI;
 }
 
 void get_baro_reading(sensors_t *sensors)

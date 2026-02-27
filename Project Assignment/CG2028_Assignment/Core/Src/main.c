@@ -105,6 +105,7 @@ static uint32_t g_last_sample_tick = 0U;
 #define TELEBOT_TASK_PERIOD_MS 100U
 #define OLED_TASK_PERIOD_MS 50U
 #define OLED_TASK_BUDGET_MS 200U
+#define REAL_FALL_REPORT_PERIOD_MS 15000U
 
 const char* NEAR_FALL_STR = "Near fall detected!";
 const char* REAL_FALL_STR = "Real fall detected!";
@@ -114,6 +115,11 @@ static uint8_t g_wifi_ready = 0;
 static const uint8_t g_wifi_socket = 1;
 static const char *g_pending_alert_msg = NULL;
 static uint8_t g_alert_pending = 0U;
+static uint8_t g_real_fall_active = 0U;
+static uint8_t g_real_fall_initial_pending = 0U;
+static uint32_t g_real_fall_start_tick = 0U;
+static uint32_t g_last_real_fall_report_tick = 0U;
+static uint32_t g_next_real_fall_report_tick = 0U;
 
 /* ---------------------------------------------------------------------------------------------------------- */
 
@@ -169,6 +175,11 @@ int main(void)
 						if (new_event == FALL_EVENT_REAL_FALL)
 						{
 							g_detector_enabled = 0U;
+							g_real_fall_active = 1U;
+							g_real_fall_initial_pending = 1U;
+							g_real_fall_start_tick = now;
+							g_last_real_fall_report_tick = 0U;
+							g_next_real_fall_report_tick = now + REAL_FALL_REPORT_PERIOD_MS;
 						}
 
 						if (new_event == FALL_EVENT_NEAR_FALL)
@@ -178,8 +189,8 @@ int main(void)
 						}
 						else if (new_event == FALL_EVENT_REAL_FALL)
 						{
-							g_pending_alert_msg = REAL_FALL_STR;
-							g_alert_pending = 1U;
+							g_pending_alert_msg = NULL;
+							g_alert_pending = 0U;
 						}
 					}
 				}
@@ -327,28 +338,6 @@ static void init (void)
 	lcd_draw_text(95, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
 	lcd_draw_text(165, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-
-	// TEMP, RMB TO DELETE
-	// HAL_Delay(4000);
-	// lcd_clear(LCD_COLOR_WHITE);
-	// lcd_draw_text(70, 20, "Haha", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-	// lcd_draw_text(80, 60, "You", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-	// lcd_draw_text(70, 100, "Fell!", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-
-	// lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(30, 175, "98.76", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(135, 175, "1234.56", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(25, 240, "12.3", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(95, 240, "45.6", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(165, 240, "78.9", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-
-	// lcd_draw_text(50, 280, "Press button", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
-	// lcd_draw_text(65, 300, "to revive", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
-
 }
 
 static int WIFI_AppSendText(const char *text)
@@ -522,7 +511,7 @@ static void button_task(uint32_t now)
 	static uint8_t  button_was_down = 0U;
 	static uint8_t  button_reset_armed = 0U;
 	static uint8_t  button_press_ticks = 0U;
-	const uint8_t BUTTON_RESET_TICKS_REQUIRED = 2U; // small debounce, no long hold
+	const uint8_t BUTTON_RESET_TICKS_REQUIRED = 10U;
 
 	if (g_latched_event != FALL_EVENT_REAL_FALL)
 	{
@@ -552,6 +541,11 @@ static void button_task(uint32_t now)
 			g_latched_event = FALL_EVENT_NONE;
 			g_current_event = FALL_EVENT_NONE;
 			g_current_event_timestamp = now;
+			g_real_fall_active = 0U;
+			g_real_fall_initial_pending = 0U;
+			g_real_fall_start_tick = 0U;
+			g_last_real_fall_report_tick = 0U;
+			g_next_real_fall_report_tick = 0U;
 			fall_detection_init();
 			g_detector_enabled = 1U;
 			button_was_down = 0U;
@@ -577,7 +571,49 @@ static void telebot_task(uint32_t now, fall_event_t event)
 {
 	(void)event;
 	static uint32_t last_attempt_tick = 0U;
+	char real_fall_msg[96];
 	uint32_t retry_interval_ms = g_wifi_ready ? 200U : 1000U;
+
+	if (g_real_fall_active)
+	{
+		uint8_t report_due = g_real_fall_initial_pending ||
+			((now - g_next_real_fall_report_tick) < 0x80000000U);
+
+		if (report_due)
+		{
+			if ((now - last_attempt_tick) < retry_interval_ms)
+			{
+				return;
+			}
+
+			last_attempt_tick = now;
+			uint32_t elapsed_seconds = (now - g_real_fall_start_tick) / 1000U;
+			uint32_t elapsed_minutes = elapsed_seconds / 60U;
+			uint32_t remaining_seconds = elapsed_seconds % 60U;
+
+			snprintf(real_fall_msg, sizeof(real_fall_msg),
+				"Real fall detected. Time since fall: %lu min %lu sec",
+				(unsigned long)elapsed_minutes,
+				(unsigned long)remaining_seconds);
+
+			if (WIFI_AppSendText(real_fall_msg) == 0)
+			{
+				g_last_real_fall_report_tick = now;
+				if (g_real_fall_initial_pending)
+				{
+					g_real_fall_initial_pending = 0U;
+				}
+				else
+				{
+					do
+					{
+						g_next_real_fall_report_tick += REAL_FALL_REPORT_PERIOD_MS;
+					} while ((now - g_next_real_fall_report_tick) < 0x80000000U);
+				}
+			}
+			return;
+		}
+	}
 
 	if (!g_alert_pending || g_pending_alert_msg == NULL)
 	{
@@ -611,47 +647,56 @@ static void oled_task(uint32_t now, sensors_t sensor_readings, fall_event_t even
 	char yaw_str[12];
 	static bool updateState = false;
 	static fall_event_t prevEvent = FALL_EVENT_NONE;
+	static uint16_t bg_color = LCD_COLOR_WHITE;
 
 	snprintf(acc_str, sizeof(acc_str), "%05.2f", sensor_readings.accel_magnitude_asm);
 	snprintf(gyro_str, sizeof(gyro_str), "%05.2f", sensor_readings.gyro_magnitude_asm);
 	snprintf(roll_str, sizeof(roll_str), "%.1f", sensor_readings.roll_pitch_yaw[0]);
 	snprintf(pitch_str, sizeof(pitch_str), "%.1f", sensor_readings.roll_pitch_yaw[1]);
 	snprintf(yaw_str, sizeof(yaw_str), "%.1f", sensor_readings.roll_pitch_yaw[2]);
+
 	
-	lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(30, 175, acc_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(30, 175, acc_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(135, 175, gyro_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(135, 175, gyro_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(20, 240, roll_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(20, 240, roll_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(95, 240, pitch_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(95, 240, pitch_str, LCD_COLOR_BLACK, bg_color, 2);
 	if ((HAL_GetTick() - slice_start) >= OLED_TASK_BUDGET_MS) return;
-	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
-	lcd_draw_text(165, 240, yaw_str, LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, bg_color, 2);
+	lcd_draw_text(165, 240, yaw_str, LCD_COLOR_BLACK, bg_color, 2);
 
 	if (event == FALL_EVENT_NEAR_FALL && updateState)
 	{
-
+		bg_color = LCD_COLOR_YELLOW;
+		lcd_clear(bg_color);
+		lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, bg_color, 4);
+		updateState = false;	
 	}
 	else if (event == FALL_EVENT_REAL_FALL && updateState)
 	{
-		lcd_clear(LCD_COLOR_WHITE);
-		lcd_draw_text(70, 20, "Haha", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-		lcd_draw_text(80, 60, "You", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-		lcd_draw_text(70, 100, "Fell!", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-		lcd_draw_text(50, 280, "Press button", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);
-		lcd_draw_text(65, 300, "to revive", LCD_COLOR_RED, LCD_COLOR_WHITE, 2);		
+		bg_color = LCD_COLOR_RED;
+		lcd_clear(bg_color);
+		lcd_draw_text(70, 20, "Haha", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(80, 60, "You", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(70, 100, "Fell!", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(50, 280, "Press button", LCD_COLOR_WHITE, bg_color, 2);
+		lcd_draw_text(65, 300, "to revive", LCD_COLOR_WHITE, bg_color, 2);		
 		updateState = false;
 	}
 	else if (updateState) {
-		lcd_clear(LCD_COLOR_WHITE);
-		lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-		lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
-		lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);		
+		bg_color = LCD_COLOR_WHITE;
+		lcd_clear(bg_color);
+		lcd_draw_text(75, 20, "Fall", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, bg_color, 4);
+		lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, bg_color, 4);		
 		updateState = false;
 	}
 
