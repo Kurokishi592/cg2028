@@ -39,7 +39,7 @@
 #include "fall_detection.h"
 
 #ifdef DEBUG
-#define FALL_DEBUG 0
+#define FALL_DEBUG 1
 #endif
 
 #define hypotf(x,y) sqrtf((x)*(x) + (y)*(y))
@@ -63,7 +63,10 @@ void SystemClock_Config(void);
 static void Buzzer_Init(void);
 static void Buzzer_On(void);
 static void Buzzer_Off(void);
-static void update_alert_outputs(fall_event_t new_event);
+static void update_alert_outputs(fall_event_t new_event); // Handles LED2 and Buzzer based on g_latched_event
+static void telebot_task(uint32_t now, fall_event_t event); // Handles Wifi and telebot messages every new NEARFALL/REALFALL
+static void oled_task(uint32_t now, fall_event_t event); // Handles OLED texts
+static void button_task(uint32_t now); // Handles user button to clear REAL_FALL latch
 
 
 UART_HandleTypeDef huart1;
@@ -120,6 +123,19 @@ static int pressure_ready = 0;
 static fall_event_t g_latched_event = FALL_EVENT_NONE;
 static uint32_t g_latched_timestamp = 0;
 
+// Current classified event and when it was set (shared across tasks)
+static fall_event_t g_current_event = FALL_EVENT_NONE;
+static uint32_t g_current_event_timestamp = 0U;
+
+// Whether the fall-detection state machine is allowed to run.
+// After a REAL_FALL is detected, we pause it until the user
+// acknowledges via the button.
+static uint8_t g_detector_enabled = 1U;
+
+// Sensor sampling period (controls how often we read sensors and run fall detection)
+#define SENSOR_SAMPLE_PERIOD_MS 20U
+static uint32_t g_last_sample_tick = 0U;
+
 const char* NEAR_FALL_STR = "Near fall detected!";
 const char* REAL_FALL_STR = "Real fall detected!";
 
@@ -142,6 +158,14 @@ int main(void)
 
 	while (1)
 	{
+		uint32_t now = HAL_GetTick();
+		fall_event_t fall_event = g_current_event; // snapshot for this loop
+
+		// -------------------------------------- SENSOR SAMPLING + FALL DETECTION (TIMED) -------------------------------------- //
+		if ((now - g_last_sample_tick) >= SENSOR_SAMPLE_PERIOD_MS)
+		{
+			g_last_sample_tick = now;
+			
 		/* -------------------------------------- READ ACCELEROMETER VALUES AND PRE-PROCESS -------------------------------------- */
 		int16_t accel_data_i16[3] = { 0 };						// Array to store the x, y and z readings of accelerometer
 		BSP_ACCELERO_AccGetXYZ(accel_data_i16);					// Function to read accelerometer values
@@ -232,15 +256,36 @@ int main(void)
 		last_pressure = pressure_hpa;
 
 		/* -------------------------------------- FALL DETECTION -------------------------------------- */
-		fall_event_t fall_event = FALL_EVENT_NONE;
-		if(i>=3) {
-			fall_event = detect_fall(accel_magnitude_asm, gyro_magnitude_asm, accel_recent_range, gyro_recent_range, roll_pitch_yaw, dp_hpa);
+		fall_event_t new_event = FALL_EVENT_NONE;
+		if (i >= 3 && g_detector_enabled)
+		{
+			new_event = detect_fall(accel_magnitude_asm, gyro_magnitude_asm,
+								   accel_recent_range, gyro_recent_range,
+								   roll_pitch_yaw, dp_hpa);
 
-			if(fall_event == FALL_EVENT_NEAR_FALL) {
-				int wifi_status = WIFI_AppSendText(NEAR_FALL_STR);
+			if (new_event != g_current_event)
+			{
+				g_current_event = new_event;
+				g_current_event_timestamp = now;
+				fall_event = new_event;
+
+				// Once we see a REAL_FALL, pause the detector until
+				// the user acknowledges via the button.
+				if (new_event == FALL_EVENT_REAL_FALL)
+				{
+					g_detector_enabled = 0U;
+				}
 			}
-			else if(fall_event == FALL_EVENT_REAL_FALL) {
+			
+			if (fall_event == FALL_EVENT_NEAR_FALL)
+			{
+				int wifi_status = WIFI_AppSendText(NEAR_FALL_STR);
+				(void)wifi_status;
+			}
+			else if (fall_event == FALL_EVENT_REAL_FALL)
+			{
 				int wifi_status = WIFI_AppSendText(REAL_FALL_STR);
+				(void)wifi_status;
 			}
 		}
 		
@@ -294,8 +339,14 @@ int main(void)
 		HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		#endif
 		i++;
-	}
+		}
 
+		// -------------------------------------- NON-BLOCKING TASKS (LED/BUZZER, TELEBOT, OLED, BUTTON) -------------------------------------- //
+		update_alert_outputs(fall_event);
+		telebot_task(now, fall_event);
+		oled_task(now, fall_event);
+		button_task(now);
+	}
 }
 
 static void init (void)
@@ -461,8 +512,9 @@ static void update_alert_outputs(fall_event_t new_event)
 {
 	uint32_t now = HAL_GetTick();
 
-	// Latch events for a short duration to avoid flicker
-	const uint32_t REAL_FALL_LATCH_MS = 5000U;
+	// Latch events to avoid flicker; REAL_FALL stays latched
+	// until cleared by the user button, NEAR_FALL auto-clears.
+	// const uint32_t REAL_FALL_LATCH_MS = 0U;   // unused now
 	const uint32_t NEAR_FALL_LATCH_MS = 2000U;
 
 	if (new_event == FALL_EVENT_REAL_FALL)
@@ -476,29 +528,45 @@ static void update_alert_outputs(fall_event_t new_event)
 		g_latched_timestamp = now;
 	}
 
-	// Auto-clear latches after timeout
-	if (g_latched_event == FALL_EVENT_REAL_FALL && (now - g_latched_timestamp) > REAL_FALL_LATCH_MS)
-	{
-		g_latched_event = FALL_EVENT_NONE;
-	}
-	else if (g_latched_event == FALL_EVENT_NEAR_FALL && (now - g_latched_timestamp) > NEAR_FALL_LATCH_MS)
+	// Auto-clear only NEAR_FALL latches after timeout; REAL_FALL
+	// is cleared by button_task() when the user acknowledges.
+	if (g_latched_event == FALL_EVENT_NEAR_FALL && (now - g_latched_timestamp) > NEAR_FALL_LATCH_MS)
 	{
 		g_latched_event = FALL_EVENT_NONE;
 	}
 
-	// Simple non-blocking beep pattern for REAL_FALL
+	// Non-blocking patterns for LED and buzzer
 	static uint32_t last_buzz_toggle = 0U;
 	static uint8_t  buzz_on = 0U;
-	const uint32_t BUZZ_ON_MS  = 120U;  // buzzer on duration
-	const uint32_t BUZZ_OFF_MS = 180U;  // buzzer off duration
+	static uint32_t last_led_toggle = 0U;
+	static uint8_t  led_on = 0U;
+
+	const uint32_t BUZZ_DELAY_MS     = 5000U; // buzzer starts 5s after REAL_FALL
+	const uint32_t BUZZ_ON_MS        = 120U;  // buzzer on duration
+	const uint32_t BUZZ_OFF_MS       = 180U;  // buzzer off duration
+	const uint32_t LED_REAL_PERIODMS = 200U;  // fast blink for REAL_FALL
+	const uint32_t LED_NEAR_PERIODMS = 600U;  // slower blink for NEAR_FALL
 
 	switch (g_latched_event)
 	{
 	case FALL_EVENT_REAL_FALL:
-		// REAL FALL: periodic beeping pattern (non-blocking)
+		// LED: fast blink
+		if ((now - last_led_toggle) >= LED_REAL_PERIODMS)
+		{
+			if (led_on) { BSP_LED_Off(LED2); led_on = 0U; }
+			else       { BSP_LED_On(LED2);  led_on = 1U; }
+			last_led_toggle = now;
+		}
+
+		// Buzzer: start beeping only after delay from event
+		if ((now - g_latched_timestamp) < BUZZ_DELAY_MS)
+		{
+			Buzzer_Off();
+			buzz_on = 0U;
+			break;
+		}
 		if (!buzz_on)
 		{
-			// currently off, check if it's time to turn on
 			if ((now - last_buzz_toggle) >= BUZZ_OFF_MS)
 			{
 				Buzzer_On();
@@ -508,7 +576,6 @@ static void update_alert_outputs(fall_event_t new_event)
 		}
 		else
 		{
-			// currently on, check if it's time to turn off
 			if ((now - last_buzz_toggle) >= BUZZ_ON_MS)
 			{
 				Buzzer_Off();
@@ -519,18 +586,146 @@ static void update_alert_outputs(fall_event_t new_event)
 		break;
 
 	case FALL_EVENT_NEAR_FALL:
-		// NEAR FALL: no buzzer
+		// NEAR FALL: slow LED blink, no buzzer
 		Buzzer_Off();
 		buzz_on = 0U;
+		if ((now - last_led_toggle) >= LED_NEAR_PERIODMS)
+		{
+			if (led_on) { BSP_LED_Off(LED2); led_on = 0U; }
+			else       { BSP_LED_On(LED2);  led_on = 1U; }
+			last_led_toggle = now;
+		}
 		break;
 
 	case FALL_EVENT_NONE:
 	default:
-		// NO FALL: buzzer fully off
+		// NO FALL: everything off
 		Buzzer_Off();
 		buzz_on = 0U;
+		BSP_LED_Off(LED2);
+		led_on = 0U;
 		break;
 	}
+}
+
+// User button task: clears latched REAL_FALL on a *press*,
+// not a long hold, but still debounces using the original
+// "release to arm, then a few consecutive pressed samples"
+// pattern. Non-blocking.
+static void button_task(uint32_t now)
+{
+	(void)now; // not used, we debounce by counts instead of time
+	static uint8_t  button_was_down = 0U;
+	static uint8_t  button_reset_armed = 0U;
+	static uint8_t  button_press_ticks = 0U;
+	const uint8_t BUTTON_RESET_TICKS_REQUIRED = 2U; // small debounce, no long hold
+
+	if (g_latched_event != FALL_EVENT_REAL_FALL)
+	{
+		button_was_down = 0U;
+		button_reset_armed = 0U;
+		button_press_ticks = 0U;
+		return;
+	}
+
+	GPIO_PinState state = BSP_PB_GetState(BUTTON_USER);
+	if (state == GPIO_PIN_SET)
+	{
+		if (!button_was_down)
+		{
+			button_was_down = 1U;
+			button_press_ticks = 1U;
+		}
+		else if (button_reset_armed)
+		{
+			if (button_press_ticks < BUTTON_RESET_TICKS_REQUIRED)
+			{
+				button_press_ticks++;
+			}
+			if (button_press_ticks >= BUTTON_RESET_TICKS_REQUIRED)
+			{
+			// Clear latched REAL_FALL and re-arm detector
+			g_latched_event = FALL_EVENT_NONE;
+			g_current_event = FALL_EVENT_NONE;
+			g_current_event_timestamp = now;
+			fall_detection_init();
+			g_detector_enabled = 1U;
+			button_was_down = 0U;
+			button_reset_armed = 0U;
+			button_press_ticks = 0U;
+			}
+		}
+	}
+	else
+	{
+		button_was_down = 0U;
+		button_press_ticks = 0U;
+		// A clean release "arms" the reset; the next
+		// short press that is stable for a couple of
+		// samples will be treated as an
+		// acknowledgement to clear REAL_FALL.
+		button_reset_armed = 1U;
+	}
+}
+
+// Telebot / Wi-Fi reporting task: send once per event change
+static void telebot_task(uint32_t now, fall_event_t event)
+{
+	// (void)now; // reserved for future backoff logic
+	// static fall_event_t last_sent_event = FALL_EVENT_NONE;
+
+	// if (!g_wifi_ready)
+	// {
+	// 	return;
+	// }
+	// if (event == FALL_EVENT_NONE || event == last_sent_event)
+	// {
+	// 	return;
+	// }
+
+	// const char *msg = NULL;
+	// if (event == FALL_EVENT_NEAR_FALL)
+	// {
+	// 	msg = NEAR_FALL_STR;
+	// }
+	// else if (event == FALL_EVENT_REAL_FALL)
+	// {
+	// 	msg = REAL_FALL_STR;
+	// }
+	// else
+	// {
+	// 	return;
+	// }
+
+	// (void)WIFI_AppSendText(msg);
+	// last_sent_event = event;
+}
+
+// OLED update task: update display only when classification changes
+static void oled_task(uint32_t now, fall_event_t event)
+{
+	// (void)now; // not currently used
+	// static fall_event_t last_drawn_event = FALL_EVENT_NONE;
+
+	// if (event == last_drawn_event)
+	// {
+	// 	return;
+	// }
+	// last_drawn_event = event;
+
+	// switch (event)
+	// {
+	// case FALL_EVENT_REAL_FALL:
+	// 	lcd_draw_text(40, 130, "REAL FALL", LCD_COLOR_RED, LCD_COLOR_WHITE, 3);
+	// 	break;
+	// case FALL_EVENT_NEAR_FALL:
+	// 	lcd_draw_text(30, 130, "NEAR FALL", LCD_COLOR_ORANGE, LCD_COLOR_WHITE, 3);
+	// 	break;
+	// case FALL_EVENT_NONE:
+	// default:
+	// 	lcd_draw_text(40, 130, "STABLE   ", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 3);
+	// 	break;
+	// }
 }
 
 

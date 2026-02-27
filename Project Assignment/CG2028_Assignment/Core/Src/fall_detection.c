@@ -117,30 +117,14 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 			lying_down_ticks++;
 			if (lying_down_ticks >= LYING_DOWN_TICKS_MIN)
 			{
-                result = FALL_EVENT_REAL_FALL;
+				result = FALL_EVENT_REAL_FALL;
 
+				// Reset internal episode state; latching and button handling
+				// are managed in main.c so we return immediately here.
+				g_fall_phase = PHASE_UPRIGHT;
 				phase_ticks = 0;
 				trigger_by_gyro = false;
 				trigger_by_accel = false;
-
-				// Button press to manually reset state after a real fall
-				bool reset = false;
-				int button_press_ticks = 0, button_reset_ticks_required = 2, button_reset_armed = false;
-				while (!reset) {
-					if (BSP_PB_GetState(BUTTON_USER) == GPIO_PIN_SET) {
-						if(button_press_ticks < button_reset_ticks_required) {
-							button_press_ticks++;
-						}
-						if(button_reset_armed && button_press_ticks >= button_reset_ticks_required) {
-							g_fall_phase = PHASE_UPRIGHT;
-							reset = true;
-							button_reset_armed = false;
-						}
-					} else {
-						button_press_ticks = 0;
-						button_reset_armed = true;
-					}
-				}
 				break;
 			}
 		}
