@@ -7,10 +7,12 @@
 /* ---------------------------------------------------------------------------------------------------------- */
 /* ------------------------------------------- Includes ----------------------------------------------------- */
 #include "main.h"
+#include "tones.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_magneto.h"
+#include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_psensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01.h"
 // #include "wifi_service2.h"
 #include "wifi.h"
@@ -58,13 +60,25 @@ typedef enum
 	FALL_EVENT_REAL_FALL = 2
 } fall_event_t;
 
+static void init(void);
+static void UART1_Init(void);
+static void Buzzer_Init(void);
+static void Buzzer_On(void);
+static void Buzzer_Off(void);
+static void update_alert_outputs(fall_event_t new_event);
+extern void initialise_monitor_handles(void);	// for semi-hosting support (printf). Will not be required if transmitting via UART
+extern int mov_avg(int N, int* accel_buff); // asm implementation
+int mov_avg_C(int N, int* accel_buff); // Reference C implementation
+int fall_get_state(void); // for debugging, returns current phase of the fall detection state machine
+
+
 // Internal fall-detection state machine phases (for debugging/inspection)
 typedef enum { PHASE_UPRIGHT = 0, PHASE_FALLING, PHASE_POSTFALL } fall_phase_t;
 
 static fall_phase_t g_fall_phase = PHASE_UPRIGHT;
 
 fall_event_t detect_fall_minimal(const float accel_filt_asm[3], const float gyro_velocity[3]);
-fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw);
+fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw, float dp_hpa);
 
 UART_HandleTypeDef huart1;
 
@@ -89,7 +103,6 @@ void Error_Handler(void)
 
 /* --------------------------- Globals and constants --------------------------- */
 const int N=4; // size of buffer
-int delay_ms=500; // LED blink period; adjusted based on fall classification
 const float G = 9.8f; // Gravitational acceleration constant
 
 // MPU raw data (for potential debugging/extension)
@@ -113,6 +126,14 @@ static float gyro_mag_window[FD_WINDOW_SIZE] = {0.0f};
 static int fd_win_idx = 0;
 static int fd_win_filled = 0;
 
+// Pressure sensor (barometer) for optional "going up" detection
+static float last_pressure = 0.0f;
+static int pressure_ready = 0;
+
+// Latched alert state for non-blocking LED/buzzer behavior
+static fall_event_t g_latched_event = FALL_EVENT_NONE;
+static uint32_t g_latched_timestamp = 0;
+
 const char* NEAR_FALL_STR = "Near fall detected!";
 const char* REAL_FALL_STR = "Real fall detected!";
 
@@ -130,6 +151,9 @@ int main(void)
 {
 	//-------------------------------------- Initialise Device --------------------------------------//
 	init(); // initialize peripherals and UART for transmission
+
+	static int csv_header_printed = 0;
+
 	while (1)
 	{
 		/* -------------------------------------- READ ACCELEROMETER VALUES AND PRE-PROCESS -------------------------------------- */
@@ -191,14 +215,14 @@ int main(void)
 		
 		// compensate for roll
 		float polar_r_xz = sqrt(mag_xyz[0]*mag_xyz[0] + mag_xyz[2]*mag_xyz[2]);
-		float theta_xz_init = atan2(mag_xyz[0],mag_xyz[2]);
+		// float theta_xz_init = atan2(mag_xyz[0],mag_xyz[2]);
 		// float polar_angle_after_roll = theta_xz_init - roll_rad;
 		mag_xyz[0] = polar_r_xz * cos(roll_rad);
 		mag_xyz[2] = polar_r_xz * sin(roll_rad);
 		
 		// compensate for pitch
 		float polar_r_yz = sqrt(mag_xyz[1]*mag_xyz[1] + mag_xyz[2]*mag_xyz[2]);
-		float theta_yz_init = atan2(mag_xyz[1],mag_xyz[2]);
+		// float theta_yz_init = atan2(mag_xyz[1],mag_xyz[2]);
 		// float polar_angle_after_pitch = theta_yz_init - pitch_rad;
 		mag_xyz[1] = polar_r_yz * cos(pitch_rad);
 		mag_xyz[2] = polar_r_yz * sin(pitch_rad);
@@ -209,54 +233,23 @@ int main(void)
 		float yaw = atan2(mag_xyz[0] - deltaX, mag_xyz[1] - deltaY);
 		roll_pitch_yaw[2] = yaw  * 180.0f/M_PI;
 		
-		/* -------------------------------------- UART TRANSMISSION -------------------------------------- */
-		// UART transmission of the results
-
-		char buffer[150]; 								// Create a buffer large enough to hold the text
-		
-		// Transmitting results of C execution over UART
-		if(i>=3)
+		/* -------------------------------------- BAROMETER (PRESSURE SENSOR) -------------------------------------- */
+		float pressure_hpa = BSP_PSENSOR_ReadPressure();
+		float dp_hpa = 0.0f;
+		if (pressure_ready)
 		{
-			// // 1. First printf() Equivalent
-			// sprintf(buffer, "Results of C execution for filtered accelerometer readings:\r\n");
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-			// // 2. Second printf() (with Floats) Equivalent
-			// // Note: Requires -u _printf_float to be enabled in Linker settings
-			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
-			// 		accel_filt_c[0], accel_filt_c[1], accel_filt_c[2]);
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-			// // Transmitting results of asm execution over UART
-
-			// // 1. First printf() Equivalent
-			// sprintf(buffer, "Results of assembly execution for filtered accelerometer readings:\r\n");
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-			
-			// // 2. Second printf() (with Floats) Equivalent
-			// // Note: Requires -u _printf_float to be enabled in Linker settings
-			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n",
-			// 		accel_filt_asm[0], accel_filt_asm[1], accel_filt_asm[2]);
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-			// // Transmitting Gyroscope readings over UART
-
-			// // 1. First printf() Equivalent
-			// sprintf(buffer, "Gyroscope sensor readings:\r\n");
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-
-			// // 2. Second printf() (with Floats) Equivalent
-			// // Note: Requires -u _printf_float to be enabled in Linker settings
-			// sprintf(buffer, "Averaged X : %f; Averaged Y : %f; Averaged Z : %f;\r\n\n",
-			// 		gyro_velocity[0], gyro_velocity[1], gyro_velocity[2]);
-			// HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			dp_hpa = pressure_hpa - last_pressure;
 		}
-		
+		else
+		{
+			pressure_ready = 1;
+		}
+		last_pressure = pressure_hpa;
+
 		/* -------------------------------------- FALL DETECTION -------------------------------------- */
-		// 
 		fall_event_t fall_event = FALL_EVENT_NONE;
 		if(i>=3) {
-			fall_event = detect_fall(accel_magnitude_asm, gyro_magnitude_asm, accel_recent_range, gyro_recent_range, roll_pitch_yaw);
+			fall_event = detect_fall(accel_magnitude_asm, gyro_magnitude_asm, accel_recent_range, gyro_recent_range, roll_pitch_yaw, dp_hpa);
 
 			if(fall_event == FALL_EVENT_NEAR_FALL)
 			{
@@ -279,37 +272,102 @@ int main(void)
 				}
 			}
 		}
+
+		/* -------------------------------------- OLED / BUZZER  -------------------------------------- */
+		update_alert_outputs(fall_event);
+
+		/* -------------------------------------- CSV DATA LOGGING OVER UART -------------------------------------- */
 		#ifdef FALL_DEBUG
+		char buffer[200];
+		if (!csv_header_printed)
+		{
+			// Header row
 			sprintf(buffer,
-					"FD,acc=%.2f,accR=%.2f,gyro=%.2f,gyroR=%.2f,roll=%.1f,pitch=%.1f,yaw=%.1f,state=%d\r\n",
-					accel_magnitude_asm,
-					accel_recent_range,
-					gyro_magnitude_asm,
-					gyro_recent_range,
-					roll_pitch_yaw[0],
-					roll_pitch_yaw[1],
-					roll_pitch_yaw[2],
-					fall_get_state());
+					"time_ms,acc,accR,gyro,gyroR,roll,pitch,yaw,pressure,dp_hpa,state,event\r\n");
 			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			csv_header_printed = 1;
+		}
+
+		// Data row
+		sprintf(buffer,
+				"%lu,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.2f,%.3f,%d,%d\r\n",
+				(unsigned long)HAL_GetTick(),
+				accel_magnitude_asm,
+				accel_recent_range,
+				gyro_magnitude_asm,
+				gyro_recent_range,
+				roll_pitch_yaw[0],
+				roll_pitch_yaw[1],
+				roll_pitch_yaw[2],
+				pressure_hpa,
+				dp_hpa,
+				fall_get_state(),
+				(int)fall_event);
+		HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		#endif
 
+		
 
-		/* -------------------------------------- LED BLINKING -------------------------------------- */
-		// Map classification to LED blink rate: slow = normal, medium = near-fall, fast = real fall
-		switch(fall_event) {
-			case FALL_EVENT_REAL_FALL:
-				delay_ms = 100;   // fast blink
-				break;
-			case FALL_EVENT_NEAR_FALL:
-				delay_ms = 250;   // medium blink
-				break;
-			case FALL_EVENT_NONE:
-			default:
-				delay_ms = 500;   // slow blink
-				break;
-		}
-		blink_LED2(delay_ms);
 		i++;
+	}
+
+}
+
+static void RF_GPIO_Init() {
+    GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+
+    /* GPIO Ports Clock Enable */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+    /*Configure GPIO pin Output Level */
+    HAL_GPIO_WritePin(SPSGRF_915_SDN_GPIO_Port, SPSGRF_915_SDN_Pin, GPIO_PIN_RESET);
+
+    /*Configure GPIO pin Output Level */
+    HAL_GPIO_WritePin(SPSGRF_915_SPI3_CSN_GPIO_Port, SPSGRF_915_SPI3_CSN_Pin, GPIO_PIN_SET);
+
+    /*Configure GPIO pins : Shutdown Pin on SPSGRF SDN */
+    GPIO_InitStruct.Pin = SPSGRF_915_SDN_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(SPSGRF_915_SDN_GPIO_Port, &GPIO_InitStruct);
+
+    /*Configure GPIO pin : SPSGRF CS */
+    GPIO_InitStruct.Pin = SPSGRF_915_SPI3_CSN_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(SPSGRF_915_SPI3_CSN_GPIO_Port, &GPIO_InitStruct);
+
+    /*Configure GPIO pin : SPSGRF GPIO3 for EXTI */
+    GPIO_InitStruct.Pin = SPSGRF_915_GPIO3_EXTI5_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(SPSGRF_915_GPIO3_EXTI5_GPIO_Port, &GPIO_InitStruct);
+
+    /* EXTI interrupt init*/
+	HAL_NVIC_SetPriority(SPSGRF_915_GPIO3_EXTI5_EXTI_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(SPSGRF_915_GPIO3_EXTI5_EXTI_IRQn);
+}
+
+static void RF_SPI3_Init() {
+    hspi3.Instance = SPI3;
+    hspi3.Init.Mode = SPI_MODE_MASTER;
+    hspi3.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi3.Init.DataSize = SPI_DATASIZE_4BIT;
+    hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi3.Init.NSS = SPI_NSS_SOFT;
+    hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+    hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi3.Init.CRCPolynomial = 7;
+    hspi3.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+	hspi3.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+    if (HAL_SPI_Init(&hspi3) != HAL_OK) {
+    	Error_Handler();
 	}
 }
 
@@ -325,7 +383,9 @@ static void init (void)
 	// Peripheral initializations using BSP functions
 	BSP_LED_Init(LED2);
 	BSP_ACCELERO_Init();
+	BSP_PSENSOR_Init();
 	BSP_GYRO_Init();
+	Buzzer_Init();
 	BSP_MAGNETO_Init();
 	BSP_LED_Off(LED2);											// Set the initial LED state to off
 	BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);					// Initialize user button
@@ -439,26 +499,99 @@ int fall_get_state(void)
 	return (int)g_fall_phase;
 }
 
-fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw)
+static void Buzzer_Init(void)
+{
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+	// Use ARD_D5 as a generic buzzer output pin (active-high)
+	GPIO_InitStruct.Pin = ARD_D5_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(ARD_D5_GPIO_Port, &GPIO_InitStruct);
+	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
+}
+
+static void Buzzer_On(void)
+{
+	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_SET);
+}
+
+static void Buzzer_Off(void)
+{
+	HAL_GPIO_WritePin(ARD_D5_GPIO_Port, ARD_D5_Pin, GPIO_PIN_RESET);
+}
+
+static void update_alert_outputs(fall_event_t new_event)
+{
+	uint32_t now = HAL_GetTick();
+
+	// Latch events for a short duration to avoid flicker
+	const uint32_t REAL_FALL_LATCH_MS = 5000U;
+	const uint32_t NEAR_FALL_LATCH_MS = 2000U;
+
+	if (new_event == FALL_EVENT_REAL_FALL)
+	{
+		g_latched_event = FALL_EVENT_REAL_FALL;
+		g_latched_timestamp = now;
+	}
+	else if (new_event == FALL_EVENT_NEAR_FALL && g_latched_event == FALL_EVENT_NONE)
+	{
+		g_latched_event = FALL_EVENT_NEAR_FALL;
+		g_latched_timestamp = now;
+	}
+
+	// Auto-clear latches after timeout
+	if (g_latched_event == FALL_EVENT_REAL_FALL && (now - g_latched_timestamp) > REAL_FALL_LATCH_MS)
+	{
+		g_latched_event = FALL_EVENT_NONE;
+	}
+	else if (g_latched_event == FALL_EVENT_NEAR_FALL && (now - g_latched_timestamp) > NEAR_FALL_LATCH_MS)
+	{
+		g_latched_event = FALL_EVENT_NONE;
+	}
+
+
+	switch (g_latched_event)
+	{
+	case FALL_EVENT_REAL_FALL:
+		// REAL FALL: buzzer alarm + intermittent red LED flash
+		Buzzer_On();
+		break;
+
+	case FALL_EVENT_NEAR_FALL:
+		// NEAR FALL: steady red LED only, no buzzer
+		Buzzer_Off();
+		break;
+
+	case FALL_EVENT_NONE:
+	default:
+		// NO FALL: everything off
+		Buzzer_Off();
+		break;
+	}
+}
+
+fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_range, float gyro_range, float* roll_pitch_yaw, float dp_hpa)
 {
 	/* Parameters to be tuned */
-	const float G_NOMINAL          = G;
+	// const float G_NOMINAL          = G;
 	const float UPRIGHT_PITCH_MIN  = 60.0f;   // |pitch| above this -> upright-ish
-	const float LYING_PITCH_MAX    = 40.0f;   // |pitch| below this -> lying-ish
-	const float MOVE_GYRO_TH       = 150.0f;  // basic "moving" threshold
-	const float BIG_GYRO_TH        = 1600.0f; // strong rotation -> potential fall
-	const float FREEFALL_LOW_TH    = 7.0f;    // accel magnitude much lower than 1g
+	const float LYING_PITCH_MAX    = 45.0f;   // |pitch| below this -> lying-ish
+	// const float MOVE_GYRO_TH       = 150.0f;  // basic "moving" threshold
+	const float BIG_GYRO_TH        = 2000.0f; // strong rotation -> potential fall
+	const float FREEFALL_LOW_TH    = 6.0f;    // accel magnitude much lower than 1g
 	const float ACC_DELTA_FALL_TH  = 3.0f;    // big change between samples
-	const int   FALLING_MAX_TICKS  = 3;      // max samples to stay in FALLING
-	const int   LYING_DOWN_TICKS_MIN = 3;     // required lying+still samples
+	const int   FALLING_MAX_TICKS  = 5;       // max samples to stay in FALLING to avoid slow tilt as real fall
+	const int   LYING_DOWN_TICKS_MIN = 4;     // required lying+still samples (shorter to catch real falls)
 	const int   POSTFALL_MAX_TICKS = 10;      // max samples to stay in POSTFALL
 
 	// These are to identify the orientation and movements of the board.
 	float pitch_deg = roll_pitch_yaw[1];
 	bool upright_now = (fabsf(pitch_deg) > UPRIGHT_PITCH_MIN);
 	bool lying_now   = (fabsf(pitch_deg) < LYING_PITCH_MAX);
-	bool moving_now  = (gyro_magnitude > MOVE_GYRO_TH);
+	// bool moving_now  = (gyro_magnitude > MOVE_GYRO_TH);
 	bool big_gyro_now = (gyro_magnitude > BIG_GYRO_TH);
+	bool going_up = (dp_hpa < -0.2f); // negative pressure delta suggests upward motion
 
 	// To differentiate between normal activity, use strong change:
 	static float prev_acc_mag = 9.8f;
@@ -468,6 +601,7 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 	bool freefall_like = (acc_magnitude < FREEFALL_LOW_TH);
 	bool strong_change = big_gyro_now || freefall_like || (acc_delta > ACC_DELTA_FALL_TH) || (pitch_delta > 15.0f);
 	static bool trigger_by_gyro = 0;
+	static bool trigger_by_accel = 0;
 
 	// To keep track of how long we've been in each phase, use counters that reset on phase change
 	static int phase_ticks = 0;
@@ -484,9 +618,10 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 		if (upright_now)
 		{
 			phase_ticks++; // we are only interested in how long we are upright
-			if (strong_change && phase_ticks > 2)
+			if (strong_change && phase_ticks > 2 && !going_up)
 			{
 				trigger_by_gyro = big_gyro_now;
+				trigger_by_accel = freefall_like || (acc_delta > ACC_DELTA_FALL_TH);
 				g_fall_phase = PHASE_FALLING;
 				phase_ticks = 0;
 			}
@@ -496,8 +631,16 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 
 	case PHASE_FALLING:
 		phase_ticks++;
+		// Capture accel and gyro activity during fall window, as both are conditions for real fall but occurs over an episode, not a single sample
+		if(gyro_magnitude > BIG_GYRO_TH) {
+			trigger_by_gyro = true;
+		}
+		if(freefall_like || (acc_delta > ACC_DELTA_FALL_TH)) {
+			trigger_by_accel = true;
+		}
+
 		// Transition to post-fall when we reach lying orientation and it was due to a huge rotation
-		if (lying_now && trigger_by_gyro)
+		if (lying_now && trigger_by_accel)
 		{
 			g_fall_phase = PHASE_POSTFALL;
 			phase_ticks = 0;
@@ -511,6 +654,8 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 			g_fall_phase = PHASE_UPRIGHT;
 			result = FALL_EVENT_NEAR_FALL;
 			phase_ticks = 0;
+			trigger_by_gyro = false;
+			trigger_by_accel = false;
 		}
 		break;
 
@@ -523,8 +668,18 @@ fall_event_t detect_fall(float acc_magnitude, float gyro_magnitude, float acc_ra
 			{
 				// Sequence: upright -> falling -> lying still for a while => real fall
 				// g_fall_phase = PHASE_UPRIGHT; // will not re-trigger until back upright
-				result = FALL_EVENT_REAL_FALL;
+				if (trigger_by_accel && trigger_by_gyro) 
+				{ 
+					result = FALL_EVENT_REAL_FALL;
+				}
+				else
+				{
+					result = FALL_EVENT_NEAR_FALL;
+				}
+				
 				phase_ticks = 0;
+				trigger_by_gyro = false;
+				trigger_by_accel = false;
 
 				// Button press to manually reset state after a real fall
 				bool reset = false;
