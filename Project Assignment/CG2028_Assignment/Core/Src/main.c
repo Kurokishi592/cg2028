@@ -165,7 +165,6 @@ int main(void)
 		accel_buff_x[i%4]=accel_data_i16[0]; 					// Acceleration along X-Axis
 		accel_buff_y[i%4]=accel_data_i16[1]; 					// Acceleration along Y-Axis
 		accel_buff_z[i%4]=accel_data_i16[2]; 					// Acceleration along Z-Axis
-
 		// Preprocessing the filtered outputs using moving average filter.
 		float accel_filt_asm[3]={0}; 							// final value of filtered acceleration values
 		accel_filt_asm[0]= (float)mov_avg(N,accel_buff_x) * (9.8/1000.0f);
@@ -252,36 +251,39 @@ int main(void)
 		if(i>=3) {
 			fall_event = detect_fall(accel_magnitude_asm, gyro_magnitude_asm, accel_recent_range, gyro_recent_range, roll_pitch_yaw, dp_hpa);
 
-			if(fall_event == FALL_EVENT_NEAR_FALL)
-			{
-				sprintf(buffer, "Classification: NEAR-FALL\r\n");
-				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			if(fall_event == FALL_EVENT_NEAR_FALL) {
 				int wifi_status = WIFI_AppSendText(NEAR_FALL_STR);
-				if (wifi_status != 0) {
-					sprintf(buffer, "WIFI send failed: %d\r\n", wifi_status);
-					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-				}
 			}
-			else if(fall_event == FALL_EVENT_REAL_FALL)
-			{
-				sprintf(buffer, "Classification: REAL FALL\r\n");
-				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			else if(fall_event == FALL_EVENT_REAL_FALL) {
 				int wifi_status = WIFI_AppSendText(REAL_FALL_STR);
-				if (wifi_status != 0) {
-					sprintf(buffer, "WIFI send failed: %d\r\n", wifi_status);
-					HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
-				}
 			}
 		}
-
+		
 		/* -------------------------------------- OLED / BUZZER  -------------------------------------- */
 		update_alert_outputs(fall_event);
-
+		
 		/* -------------------------------------- CSV DATA LOGGING OVER UART -------------------------------------- */
 		#ifdef FALL_DEBUG
 		char buffer[200];
-		if (!csv_header_printed)
-		{
+		if(fall_event == FALL_EVENT_NEAR_FALL) {
+			sprintf(buffer, "Classification: NEAR-FALL\r\n");
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			int wifi_status = WIFI_AppSendText(NEAR_FALL_STR);
+			if (wifi_status != 0) {
+				sprintf(buffer, "WIFI send failed: %d\r\n", wifi_status);
+				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			}
+		}
+		else if(fall_event == FALL_EVENT_REAL_FALL) {
+			sprintf(buffer, "Classification: REAL FALL\r\n");
+			HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			int wifi_status = WIFI_AppSendText(REAL_FALL_STR);
+			if (wifi_status != 0) {
+				sprintf(buffer, "WIFI send failed: %d\r\n", wifi_status);
+				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
+			}
+		}
+		if (!csv_header_printed) {
 			// Header row
 			sprintf(buffer,
 					"time_ms,acc,accR,gyro,gyroR,roll,pitch,yaw,pressure,dp_hpa,state,event\r\n");
@@ -306,70 +308,9 @@ int main(void)
 				(int)fall_event);
 		HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), HAL_MAX_DELAY);
 		#endif
-
-		
-
 		i++;
 	}
 
-}
-
-static void RF_GPIO_Init() {
-    GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-
-    /* GPIO Ports Clock Enable */
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_GPIOE_CLK_ENABLE();
-
-    /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(SPSGRF_915_SDN_GPIO_Port, SPSGRF_915_SDN_Pin, GPIO_PIN_RESET);
-
-    /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(SPSGRF_915_SPI3_CSN_GPIO_Port, SPSGRF_915_SPI3_CSN_Pin, GPIO_PIN_SET);
-
-    /*Configure GPIO pins : Shutdown Pin on SPSGRF SDN */
-    GPIO_InitStruct.Pin = SPSGRF_915_SDN_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(SPSGRF_915_SDN_GPIO_Port, &GPIO_InitStruct);
-
-    /*Configure GPIO pin : SPSGRF CS */
-    GPIO_InitStruct.Pin = SPSGRF_915_SPI3_CSN_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(SPSGRF_915_SPI3_CSN_GPIO_Port, &GPIO_InitStruct);
-
-    /*Configure GPIO pin : SPSGRF GPIO3 for EXTI */
-    GPIO_InitStruct.Pin = SPSGRF_915_GPIO3_EXTI5_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(SPSGRF_915_GPIO3_EXTI5_GPIO_Port, &GPIO_InitStruct);
-
-    /* EXTI interrupt init*/
-	HAL_NVIC_SetPriority(SPSGRF_915_GPIO3_EXTI5_EXTI_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(SPSGRF_915_GPIO3_EXTI5_EXTI_IRQn);
-}
-
-static void RF_SPI3_Init() {
-    hspi3.Instance = SPI3;
-    hspi3.Init.Mode = SPI_MODE_MASTER;
-    hspi3.Init.Direction = SPI_DIRECTION_2LINES;
-    hspi3.Init.DataSize = SPI_DATASIZE_4BIT;
-    hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
-    hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
-    hspi3.Init.NSS = SPI_NSS_SOFT;
-    hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-    hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
-    hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
-    hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-    hspi3.Init.CRCPolynomial = 7;
-    hspi3.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-	hspi3.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-    if (HAL_SPI_Init(&hspi3) != HAL_OK) {
-    	Error_Handler();
-	}
 }
 
 static void init (void)
@@ -437,6 +378,17 @@ static void init (void)
 	lcd_draw_text(15, 60, "Detection", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
 	lcd_draw_text(50, 100, "Device", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 4);
 	
+	lcd_draw_text(35, 150, "Accel", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(30, 175, "00.00", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(150, 150, "Gyro", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(135, 175, "0000.00", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 215, "Roll", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(25, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(90, 215, "Pitch", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(95, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(175, 215, "Yaw", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+	lcd_draw_text(170, 240, "00.0", LCD_COLOR_BLACK, LCD_COLOR_WHITE, 2);
+
 	// TEMP, RMB TO DELETE
 	HAL_Delay(4000);
 	lcd_clear(LCD_COLOR_WHITE);
