@@ -7,28 +7,29 @@
 /* ---------------------------------------------------------------------------------------------------------- */
 /* ------------------------------------------- Includes ----------------------------------------------------- */
 #include "main.h"
-#include "tones.h"
+#include "stdio.h"
+#include "string.h"
+#include "math.h"
+#include <sys/stat.h>
+#include <stdbool.h>
+
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_accelero.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_tsensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_gyro.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_magneto.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01_psensor.h"
 #include "../../Drivers/BSP/B-L4S5I-IOT01/stm32l4s5i_iot01.h"
-// #include "wifi_service2.h"
-#include "wifi.h"
-#include "wifi_secrets.h"
-
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Types.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_PktBasic.h"
 #include "../../Drivers/BSP/Components/spirit1/SPIRIT1_Library/Inc/SPIRIT_Irq.h"
 
+// #include "wifi_service2.h"
+#include "wifi.h"
+#include "wifi_secrets.h"
+
 #include "lcd.h"
 
-#include "stdio.h"
-#include "string.h"
-#include "math.h"
-#include <sys/stat.h>
-#include <stdbool.h>
+#include "tones.h"
 
 #ifdef DEBUG
 #define FALL_DEBUG 0
@@ -550,23 +551,49 @@ static void update_alert_outputs(fall_event_t new_event)
 		g_latched_event = FALL_EVENT_NONE;
 	}
 
+	// Simple non-blocking beep pattern for REAL_FALL
+	static uint32_t last_buzz_toggle = 0U;
+	static uint8_t  buzz_on = 0U;
+	const uint32_t BUZZ_ON_MS  = 120U;  // buzzer on duration
+	const uint32_t BUZZ_OFF_MS = 180U;  // buzzer off duration
 
 	switch (g_latched_event)
 	{
 	case FALL_EVENT_REAL_FALL:
-		// REAL FALL: buzzer alarm + intermittent red LED flash
-		Buzzer_On();
+		// REAL FALL: periodic beeping pattern (non-blocking)
+		if (!buzz_on)
+		{
+			// currently off, check if it's time to turn on
+			if ((now - last_buzz_toggle) >= BUZZ_OFF_MS)
+			{
+				Buzzer_On();
+				buzz_on = 1U;
+				last_buzz_toggle = now;
+			}
+		}
+		else
+		{
+			// currently on, check if it's time to turn off
+			if ((now - last_buzz_toggle) >= BUZZ_ON_MS)
+			{
+				Buzzer_Off();
+				buzz_on = 0U;
+				last_buzz_toggle = now;
+			}
+		}
 		break;
 
 	case FALL_EVENT_NEAR_FALL:
-		// NEAR FALL: steady red LED only, no buzzer
+		// NEAR FALL: no buzzer
 		Buzzer_Off();
+		buzz_on = 0U;
 		break;
 
 	case FALL_EVENT_NONE:
 	default:
-		// NO FALL: everything off
+		// NO FALL: buzzer fully off
 		Buzzer_Off();
+		buzz_on = 0U;
 		break;
 	}
 }
